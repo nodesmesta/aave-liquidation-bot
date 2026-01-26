@@ -1,0 +1,3 @@
+@aave/core-v3/=node_modules/@aave/core-v3/
+@openzeppelin/=lib/openzeppelin-contracts/
+forge-std/=lib/forge-std/src/
