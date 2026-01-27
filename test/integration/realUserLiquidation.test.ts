@@ -1,11 +1,16 @@
 import { expect } from 'chai';
-import { formatUnits } from 'viem';
+import { createPublicClient, formatUnits, http } from 'viem';
+import { base } from 'viem/chains';
 import { OptimizedLiquidationService, LiquidationParams } from '../../src/services/OptimizedLiquidationService';
 import { PriceOracle } from '../../src/services/PriceOracle';
 describe('Real User Liquidation Test - On-Chain Data', () => {
   let service: OptimizedLiquidationService;
   const RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
   const PROTOCOL_DATA_PROVIDER = '0x2d8A3C5677189723C4cB8873CfC9C8976FDF38Ac';
+  const publicClient = createPublicClient({
+    chain: base,
+    transport: http(RPC_URL),
+  });
   before(() => {
     service = new OptimizedLiquidationService(RPC_URL, PROTOCOL_DATA_PROVIDER);
   });
@@ -46,7 +51,7 @@ describe('Real User Liquidation Test - On-Chain Data', () => {
       }
       expect(collateralReserves.length).to.be.greaterThan(0, 'User should have collateral');
       expect(debtReserves.length).to.be.greaterThan(0, 'User should have debt');
-      const priceOracle = new PriceOracle(RPC_URL);
+      const priceOracle = new PriceOracle(publicClient);
       const assetAddresses = userReserves.map(r => r.asset);
       const priceMap = await priceOracle.getAssetsPrices(assetAddresses);
       let totalCollateralUSD = 0;

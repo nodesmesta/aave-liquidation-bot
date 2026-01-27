@@ -65,11 +65,11 @@ export class OptimizedLiquidationService {
   constructor(rpcUrl: string, protocolDataProvider: string) {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
-    this.priceOracle = new PriceOracle(rpcUrl);
     this.publicClient = createPublicClient({
       chain: base,
       transport: http(rpcUrl),
     });
+    this.priceOracle = new PriceOracle(this.publicClient);
   }
 
   /**

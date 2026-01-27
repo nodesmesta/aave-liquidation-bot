@@ -11,12 +11,12 @@ export interface UserHealth {
   availableBorrowsBase: bigint;
   currentLiquidationThreshold: bigint;
   ltv: bigint;
-  status: 'LIQUIDATABLE' | 'CRITICAL' | 'AT_RISK' | 'SAFE';
+  status: 'LIQUIDATABLE' | 'CRITICAL' | 'WARNING' | 'SAFE';
 }
 
 export class HealthChecker {
   private poolAddress: string;
-  private publicClient: any; // ReturnType<typeof createPublicClient> causes viem internal type conflicts
+  private publicClient: any;
   private poolAbi = parseAbi([
     'function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
   ]);
@@ -107,14 +107,14 @@ export class HealthChecker {
 
   /**
    * @notice Determine user status based on health factor
-   * @dev Aligned with bot strategy (HF < 1.1): <1.0=LIQUIDATABLE, <1.05=CRITICAL, <1.1=AT_RISK, >=1.1=SAFE
+   * @dev Aligned with bot strategy (HF < 1.1): <1.0=LIQUIDATABLE, <1.05=CRITICAL, <1.1=WARNING, >=1.1=SAFE
    * @param healthFactor User's health factor (normalized to decimal)
    * @return Status label for the user
    */
   private determineStatus(healthFactor: number): UserHealth['status'] {
     if (healthFactor < 1.0) return 'LIQUIDATABLE';
     if (healthFactor < 1.05) return 'CRITICAL';
-    if (healthFactor < 1.1) return 'AT_RISK';
+    if (healthFactor < 1.1) return 'WARNING';
     return 'SAFE';
   }
 
@@ -134,7 +134,7 @@ export class HealthChecker {
    * @notice Filter users with any risk level (not SAFE)
    * @dev Excludes only users with status 'SAFE' (HF >= 1.1)
    * @param healthMap Map of user addresses to health data
-   * @return Array of risky users (LIQUIDATABLE, CRITICAL, or AT_RISK with HF < 1.1)
+   * @return Array of risky users (LIQUIDATABLE, CRITICAL, or WARNING with HF < 1.1)
    */
   filterRisky(healthMap: Map<string, UserHealth>): UserHealth[] {
     return Array.from(healthMap.values()).filter(
