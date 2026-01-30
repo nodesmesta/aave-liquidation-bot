@@ -348,22 +348,34 @@ class LiquidatorBot {
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
       logger.info(`Found ${liquidatable.length} liquidatable users`);
+      const liquidationPromises = liquidatable.map(userHealth => 
+        this.executeLiquidation(userHealth)
+          .then(success => ({ user: userHealth.user, success }))
+          .catch(error => {
+            logger.error(`Liquidation error for ${userHealth.user}:`, error);
+            return { user: userHealth.user, success: false };
+          })
+      );
+      const results = await Promise.allSettled(liquidationPromises);
       let successfulLiquidations = 0;
       let failedLiquidations = 0;
       const successfullyLiquidatedUsers: string[] = [];
-      
-      for (const userHealth of liquidatable) {
-        const success = await this.executeLiquidation(userHealth);
-        if (success) {
-          successfulLiquidations++;
-          successfullyLiquidatedUsers.push(userHealth.user);
-          logger.info(`Liquidated ${userHealth.user} (${successfulLiquidations}/${liquidatable.length})`);
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          const { user, success } = result.value;
+          if (success) {
+            successfulLiquidations++;
+            successfullyLiquidatedUsers.push(user);
+            logger.info(`Liquidated ${user}`);
+          } else {
+            failedLiquidations++;
+            logger.warn(`Failed to liquidate ${user}`);
+          }
         } else {
           failedLiquidations++;
-          logger.warn(`Failed to liquidate ${userHealth.user}`);
+          logger.error(`Promise rejected:`, result.reason);
         }
       }
-    
     logger.info(`Liquidation summary: ${successfulLiquidations} successful, ${failedLiquidations} failed`);
     
     if (successfullyLiquidatedUsers.length > 0) {
