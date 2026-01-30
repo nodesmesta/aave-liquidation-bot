@@ -83,10 +83,10 @@ export class LiquidationExecutor {
         functionName: 'executeLiquidation',
         args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
         account: this.account,
-        chain: undefined,
         maxFeePerGas: gasSettings.maxFeePerGas,
         maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
         gas: gasSettings.gas,
+        chain: null,
       });
       logger.info(`Transaction sent: ${hash}`);
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
@@ -144,7 +144,7 @@ export class LiquidationExecutor {
       functionName: 'transferOwnership',
       args: [newOwner as Address],
       account: this.account,
-      chain: undefined,
+      chain: null,
     });
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);
