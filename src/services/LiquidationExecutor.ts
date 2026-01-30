@@ -86,7 +86,7 @@ export class LiquidationExecutor {
         maxFeePerGas: gasSettings.maxFeePerGas,
         maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
         gas: gasSettings.gas,
-        chain: null,
+        chain: base,
       });
       logger.info(`Transaction sent: ${hash}`);
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
@@ -144,7 +144,7 @@ export class LiquidationExecutor {
       functionName: 'transferOwnership',
       args: [newOwner as Address],
       account: this.account,
-      chain: null,
+      chain: base,
     });
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);

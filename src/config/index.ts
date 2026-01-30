@@ -9,7 +9,6 @@ export const config = {
     rpcUrl: process.env.BASE_RPC_URL || '',
     wssUrl: process.env.BASE_WSS_URL || '',
     wssUrlFallback: process.env.BASE_WSS_URL_FALLBACK || '',
-    chainId: parseInt(process.env.CHAIN_ID || '8453'),
   },
 
   // Wallet

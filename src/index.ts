@@ -228,8 +228,8 @@ class LiquidatorBot {
     logger.info(`Connected to network: Base (Chain ID: ${chainId})`);
     logger.info(`Current block: ${blockNumber}`);
     logger.info(`Wallet balance: ${formatEther(balance)} ETH`);
-    if (Number(chainId) !== config.network.chainId) {
-      throw new Error(`Wrong network! Expected ${config.network.chainId}, got ${chainId}`);
+    if (Number(chainId) !== base.id) {
+      throw new Error(`Wrong network! Expected ${base.id}, got ${chainId}`);
     }
   }
 
@@ -413,7 +413,7 @@ class LiquidatorBot {
   private logStatus(): void {
     const stats = this.executor.getStats();
     logger.info('Bot Status');
-    logger.info(`Network: Base (${config.network.chainId})`);
+    logger.info(`Network: Base (${base.id})`);
     logger.info(`Wallet: ${this.account.address}`);
     logger.info(`Total Attempts: ${stats.totalAttempts}`);
     logger.info(`Successful: ${stats.successfulLiquidations}`);
