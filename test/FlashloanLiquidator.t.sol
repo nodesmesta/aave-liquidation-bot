@@ -128,7 +128,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         vm.startPrank(testUser);
         IERC20(WETH).approve(POOL_ADDRESS, type(uint256).max);
         pool.supply(WETH, 1 ether, testUser, 0);
-        pool.borrow(USDC, 2200e6, 2, 0, testUser);
+        pool.borrow(USDC, 2000e6, 2, 0, testUser);
         vm.stopPrank();
         
         (,,,,,uint256 hfBefore) = pool.getUserAccountData(testUser);
@@ -138,22 +138,18 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         vm.warp(block.timestamp + 500 days);
         vm.roll(block.number + 360000);
         
-        (,,,,,uint256 hfAfterWarp) = pool.getUserAccountData(testUser);
-        
-        // Jika masih belum liquidatable, drop harga WETH menggunakan mock oracle
-        if (hfAfterWarp >= LIQUIDATABLE_THRESHOLD) {
-            vm.mockCall(
-                0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156,
-                abi.encodeWithSignature("getAssetPrice(address)", WETH),
-                abi.encode(217500000000)
-            );
-        }
+        // Drop harga WETH untuk membuat liquidatable
+        vm.mockCall(
+            0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156,
+            abi.encodeWithSignature("getAssetPrice(address)", WETH),
+            abi.encode(200000000000)
+        );
         
         (,uint256 totalDebt,,,,uint256 healthFactor) = pool.getUserAccountData(testUser);
         assertTrue(isLiquidatable(healthFactor), "Position should be liquidatable");
         
         uint256 closeFactor = calculateCloseFactor(healthFactor);
-        uint256 debtToCover = ((totalDebt / 100) * closeFactor) / 10000;
+        uint256 debtToCover = (totalDebt * closeFactor) / 10000;
         if (debtToCover > 2500e6) debtToCover = 2500e6;
         
         assertGt(debtToCover, 0, "Debt to cover should be positive");

@@ -398,7 +398,6 @@ class LiquidatorBot {
     
     if (tx.success) {
       logger.info(`Liquidation successful! TX: ${tx.txHash}`);
-      logger.info(`Profit realized: $${tx.profitRealized?.toFixed(2)}`);
       return true;
     } else {
       logger.error(`Liquidation failed: ${tx.error}`);
@@ -418,7 +417,6 @@ class LiquidatorBot {
     logger.info(`Total Attempts: ${stats.totalAttempts}`);
     logger.info(`Successful: ${stats.successfulLiquidations}`);
     logger.info(`Success Rate: ${stats.successRate.toFixed(2)}%`);
-    logger.info(`Total Profit: $${stats.totalProfitUSD.toFixed(2)}`);
   }
 }
 

@@ -10,7 +10,6 @@ export interface ExecutionResult {
   txHash?: string;
   error?: string;
   gasUsed?: bigint;
-  profitRealized?: number;
 }
 
 export class LiquidationExecutor {
@@ -20,17 +19,14 @@ export class LiquidationExecutor {
   private gasManager: GasManager;
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
-
     'function transferOwnership(address newOwner) external',
     'function approveToken(address token, address spender, uint256 amount) external',
-    'function calculateSafeDebtAmount(uint256 targetDebt) public pure returns (uint256 safeDebt)',
     'function isAaveReserve(address token) public view returns (bool)',
   ]);
   private stats = {
     totalAttempts: 0,
     successfulLiquidations: 0,
     failedLiquidations: 0,
-    totalProfitUSD: 0,
     totalGasSpent: 0n,
     consecutiveLosses: 0,
   };
@@ -73,7 +69,6 @@ export class LiquidationExecutor {
         collateral: collateralAsset,
         debt: debtAsset,
         debtToCover: debtToCover.toString(),
-        actualDebt: ((debtToCover * 99n) / 100n).toString(),
       });
       const fixedGasLimit = 920000n;
       const gasSettings = await this.gasManager.getOptimalGasSettings(fixedGasLimit);

@@ -95,9 +95,8 @@ contract FlashloanLiquidator {
         address user,
         uint256 debtToCover
     ) external onlyOwner {
-        uint256 safeDebtAmount = calculateSafeDebtAmount(debtToCover);
         bytes memory params = abi.encode(collateralAsset, user);
-        POOL.flashLoanSimple(address(this), debtAsset, safeDebtAmount, params, 0);
+        POOL.flashLoanSimple(address(this), debtAsset, debtToCover, params, 0);
     }
 
     /**
@@ -205,16 +204,6 @@ contract FlashloanLiquidator {
      */
     function approveToken(address token, address spender, uint256 amount) external onlyOwner {
         SafeERC20.forceApprove(IERC20(token), spender, amount);
-    }
-
-    /**
-     * @notice Calculate safe debt amount with 1% reduction for fees and buffer
-     * @dev Reduces debt to account for flashloan fee (0.05%), swap fee (0.3%), and buffer (0.65%)
-     * @param targetDebt Ideal debt amount to cover
-     * @return safeDebt Adjusted debt amount ensuring profitability
-     */
-    function calculateSafeDebtAmount(uint256 targetDebt) public pure returns (uint256 safeDebt) {
-        safeDebt = (targetDebt * 99) / 100;
     }
 
     /**
