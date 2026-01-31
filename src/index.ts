@@ -10,6 +10,7 @@ import { SubgraphService } from './services/SubgraphService';
 import { OptimizedLiquidationService } from './services/OptimizedLiquidationService';
 import { UserPool } from './services/UserPool';
 import { SupportedAsset } from './config/assets';
+import { LiquidationParams } from './services/OptimizedLiquidationService';
 
 class LiquidatorBot {
   private rpcUrl: string;
@@ -352,90 +353,80 @@ class LiquidatorBot {
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
       logger.info(`Found ${liquidatable.length} liquidatable users`);
-      
-      const usersToLiquidate = liquidatable.filter(userHealth => {
+      const availableUsers = liquidatable.filter(userHealth => {
         if (this.inFlightLiquidations.has(userHealth.user)) {
           logger.debug(`Skipping ${userHealth.user} - already being liquidated`);
           return false;
         }
         return true;
       });
-      
-      if (usersToLiquidate.length === 0) {
+      if (availableUsers.length === 0) {
         logger.info('All liquidatable users already in-flight, skipping');
         return;
       }
-      
-      logger.info(`Processing ${usersToLiquidate.length} users (${liquidatable.length - usersToLiquidate.length} already in-flight)`);
-      const liquidationPromises = usersToLiquidate.map(userHealth => 
-        this.executeLiquidation(userHealth)
-          .then(success => ({ user: userHealth.user, success }))
-          .catch(error => {
-            logger.error(`Liquidation error for ${userHealth.user}:`, error);
-            return { user: userHealth.user, success: false };
-          })
-      );
-      const results = await Promise.allSettled(liquidationPromises);
-      let successfulLiquidations = 0;
-      let failedLiquidations = 0;
-      const successfullyLiquidatedUsers: string[] = [];
-      for (const result of results) {
-        if (result.status === 'fulfilled') {
-          const { user, success } = result.value;
-          if (success) {
-            successfulLiquidations++;
-            successfullyLiquidatedUsers.push(user);
-            logger.info(`Liquidated ${user}`);
-          } else {
-            failedLiquidations++;
-            logger.warn(`Failed to liquidate ${user}`);
-          }
-        } else {
-          failedLiquidations++;
-          logger.error(`Promise rejected:`, result.reason);
-        }
-      }
-    logger.info(`Liquidation summary: ${successfulLiquidations} successful, ${failedLiquidations} failed`);
-    
-    if (successfullyLiquidatedUsers.length > 0) {
-      logger.info(`${successfullyLiquidatedUsers.length} liquidation(s) successful, initiating auto-restart...`);
-      await this.restart();
-    }
+      const selection = await this.selectBestLiquidation(availableUsers);
+      if (!selection) return;
+      const success = await this.executeLiquidationWithParams(selection.user, selection.params);
+      if (success) await this.restart();
   }
 
-  /**
-   * @notice Execute liquidation for a single user
-   * @dev Gets liquidation params via multicall (1 RPC vs 9), checks gas balance, executes on-chain
-   * @param userHealth User health data from multicall
-   */
-  private async executeLiquidation(userHealth: UserHealth): Promise<boolean> {
-    this.inFlightLiquidations.add(userHealth.user);
-    try {
-      logger.info(`Executing liquidation for ${userHealth.user} (HF: ${userHealth.healthFactor})`);
-      const params = await this.optimizedLiquidation.getLiquidationParams(userHealth);
-    if (!params) return false;
-    logger.info(
-      `Selected: ${params.collateralSymbol}→${params.debtSymbol} ` +
-      `(bonus: ${params.liquidationBonus}%, value: ~$${params.estimatedValue.toFixed(2)})`
-    );
-    logger.info(
-      `Debt to cover: ${formatUnits(params.debtToCover, 6)} ${params.debtSymbol}`
-    );
-    logger.info(`Executing liquidation...`);
-    const tx = await this.executor.executeLiquidation(
-      params.collateralAsset,
-      params.debtAsset,
-      params.userAddress,
-      params.debtToCover
+  private async selectBestLiquidation(
+    users: UserHealth[]
+  ): Promise<{ user: UserHealth; params: LiquidationParams } | null> {
+    const results = await Promise.all(
+      users.map(async (user) => {
+        try {
+          const params = await this.optimizedLiquidation.getLiquidationParams(user);
+          if (!params) return null;
+          return { user, params, score: this.calculateLiquidationScore(params, user) };
+        } catch {
+          return null;
+        }
+      })
     );
     
-    if (tx.success) {
-      logger.info(`Liquidation successful! TX: ${tx.txHash}`);
-      return true;
-    } else {
-      logger.error(`Liquidation failed: ${tx.error}`);
+    const valid = results.filter(r => r !== null) as Array<{
+      user: UserHealth;
+      params: LiquidationParams;
+      score: number;
+    }>;
+    
+    if (valid.length === 0) return null;
+    
+    valid.sort((a, b) => b.score - a.score);
+    const best = valid[0];
+    logger.info(
+      `Selected: ${best.params.collateralSymbol}→${best.params.debtSymbol} ` +
+      `(bonus: ${best.params.liquidationBonus}%, $${best.params.estimatedValue.toFixed(0)})`
+    );
+    return { user: best.user, params: best.params };
+  }
+
+  private calculateLiquidationScore(params: LiquidationParams, userHealth: UserHealth): number {
+    return (
+      params.liquidationBonus * 40 + 
+      Math.min(params.estimatedValue / 100, 30) +
+      Math.max(0, 1.0 - userHealth.healthFactor) * 300
+    );
+  }
+
+  private async executeLiquidationWithParams(
+    userHealth: UserHealth,
+    params: LiquidationParams
+  ): Promise<boolean> {
+    this.inFlightLiquidations.add(userHealth.user);
+    try {
+      const tx = await this.executor.executeLiquidation(
+        params.collateralAsset,
+        params.debtAsset,
+        params.userAddress,
+        params.debtToCover
+      );
+      if (tx.success) {
+        logger.info(`Liquidated: ${tx.txHash}`);
+        return true;
+      }
       return false;
-    }
     } finally {
       this.inFlightLiquidations.delete(userHealth.user);
     }

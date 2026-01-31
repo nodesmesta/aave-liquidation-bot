@@ -20,7 +20,7 @@ export class GasManager {
   async getOptimalGasSettings(gasLimit: bigint): Promise<GasSettings> {
     const gasPrice = await this.publicClient.getGasPrice();
     const baseFee = gasPrice;
-    const priorityFee = 500000000n;
+    const priorityFee = 1000000000n;
     const maxFeePerGas = (baseFee * 110n) / 100n + priorityFee;
     return {
       maxFeePerGas,
