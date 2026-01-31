@@ -268,8 +268,8 @@ export class OptimizedLiquidationService {
   }
 
   /**
-   * @notice Prepare liquidation parameters using exact Aave liquidation logic
-   * @dev Calculates exact debtToCover based on health factor, close factor, AND available collateral
+   * @notice Prepare liquidation parameters with collateral constraint
+   * @dev Aave V3 handles close factor internally (50%/100% based on HF), bot only needs collateral limit
    * @param userAddress Address of user to liquidate
    * @param collateral Collateral reserve data from protocol
    * @param debt Debt reserve data from protocol
@@ -282,10 +282,7 @@ export class OptimizedLiquidationService {
     debt: UserReserveData,
     healthFactor: number
   ): Promise<LiquidationParams | null> {
-    const CLOSE_FACTOR_HF_THRESHOLD = 0.95;
-    const closeFactor = healthFactor > CLOSE_FACTOR_HF_THRESHOLD ? 0.5 : 1.0;
     const totalDebt = debt.debtBalance;
-    const maxDebtByCloseFactor = (totalDebt * BigInt(Math.floor(closeFactor * 10000))) / 10000n;
     const priceMap = await this.priceOracle.getAssetsPrices([collateral.asset, debt.asset]);
     const collateralPrice = priceMap.get(collateral.asset);
     const debtPrice = priceMap.get(debt.asset);
@@ -304,8 +301,8 @@ export class OptimizedLiquidationService {
     const maxDebtByCollateralBN = BigInt(
       Math.floor(maxDebtByCollateral * 10 ** debt.decimals)
     );
-    const debtToCover = maxDebtByCloseFactor < maxDebtByCollateralBN 
-      ? maxDebtByCloseFactor 
+    const debtToCover = totalDebt < maxDebtByCollateralBN 
+      ? totalDebt 
       : maxDebtByCollateralBN;
     if (debtToCover === 0n) {
       logger.warn('Calculated debtToCover is 0, skipping liquidation');
@@ -315,8 +312,7 @@ export class OptimizedLiquidationService {
     const estimatedValue = debtValue * liquidationBonusMultiplier;
 
     logger.info(
-      `Liquidation calc: closeFactor=${closeFactor*100}%, ` +
-      `maxByCloseFactor=${formatUnits(maxDebtByCloseFactor, debt.decimals)}, ` +
+      `Liquidation calc: totalDebt=${formatUnits(totalDebt, debt.decimals)}, ` +
       `maxByCollateral=${maxDebtByCollateral.toFixed(4)}, ` +
       `final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol}`
     );
