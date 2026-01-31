@@ -26,6 +26,7 @@ class LiquidatorBot {
   private isCheckingUsers = false;
   private isRestarting = false;
   private pendingUserChecks: Set<string> = new Set();
+  private inFlightLiquidations: Set<string> = new Set();
   private static usingPrimaryWss = true;
 
   constructor() {
@@ -126,6 +127,7 @@ class LiquidatorBot {
     this.isInitialized = false;
     await this.waitForOngoingChecks(5000);
     this.pendingUserChecks.clear();
+    this.inFlightLiquidations.clear();
     this.isCheckingUsers = false;
     this.priceOracle.stopPriceMonitoring();
     logger.info('Final Statistics:', this.executor.getStats());
@@ -350,7 +352,22 @@ class LiquidatorBot {
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
       logger.info(`Found ${liquidatable.length} liquidatable users`);
-      const liquidationPromises = liquidatable.map(userHealth => 
+      
+      const usersToLiquidate = liquidatable.filter(userHealth => {
+        if (this.inFlightLiquidations.has(userHealth.user)) {
+          logger.debug(`Skipping ${userHealth.user} - already being liquidated`);
+          return false;
+        }
+        return true;
+      });
+      
+      if (usersToLiquidate.length === 0) {
+        logger.info('All liquidatable users already in-flight, skipping');
+        return;
+      }
+      
+      logger.info(`Processing ${usersToLiquidate.length} users (${liquidatable.length - usersToLiquidate.length} already in-flight)`);
+      const liquidationPromises = usersToLiquidate.map(userHealth => 
         this.executeLiquidation(userHealth)
           .then(success => ({ user: userHealth.user, success }))
           .catch(error => {
@@ -392,8 +409,10 @@ class LiquidatorBot {
    * @param userHealth User health data from multicall
    */
   private async executeLiquidation(userHealth: UserHealth): Promise<boolean> {
-    logger.info(`Executing liquidation for ${userHealth.user} (HF: ${userHealth.healthFactor})`);
-    const params = await this.optimizedLiquidation.getLiquidationParams(userHealth);
+    this.inFlightLiquidations.add(userHealth.user);
+    try {
+      logger.info(`Executing liquidation for ${userHealth.user} (HF: ${userHealth.healthFactor})`);
+      const params = await this.optimizedLiquidation.getLiquidationParams(userHealth);
     if (!params) return false;
     logger.info(
       `Selected: ${params.collateralSymbol}→${params.debtSymbol} ` +
@@ -416,6 +435,9 @@ class LiquidatorBot {
     } else {
       logger.error(`Liquidation failed: ${tx.error}`);
       return false;
+    }
+    } finally {
+      this.inFlightLiquidations.delete(userHealth.user);
     }
   }
 
