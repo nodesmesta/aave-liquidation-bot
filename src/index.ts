@@ -53,6 +53,11 @@ class LiquidatorBot {
     try {
       logger.info('Initializing liquidation bot...');
       logger.info('Strategy: USDC debt users + on-chain validation (HF < 1.1)');
+      
+      // Initialize NonceManager (critical for parallel execution)
+      await this.executor.initialize();
+      logger.info('NonceManager initialized for thread-safe parallel execution');
+      
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No liquidation candidates found from Subgraph');
