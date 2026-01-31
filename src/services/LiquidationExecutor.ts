@@ -6,6 +6,9 @@ import { createAccount } from '../utils/wallet';
 import { GasManager } from './GasManager';
 import { NonceManager } from './NonceManager';
 
+/**
+ * @notice Result of a liquidation execution attempt
+ */
 export interface ExecutionResult {
   success: boolean;
   txHash?: string;
@@ -13,10 +16,14 @@ export interface ExecutionResult {
   gasUsed?: bigint;
 }
 
+/**
+ * @notice Handles liquidation execution with thread-safe nonce management
+ * @dev Manages wallet client, gas settings, and transaction broadcasting
+ */
 export class LiquidationExecutor {
   private account: ReturnType<typeof createAccount>;
   private walletClient: ReturnType<typeof viemCreateWalletClient>;
-  private publicClient: any;
+  private publicClient: any; // PublicClient type causes conflicts with multiple viem imports
   private gasManager: GasManager;
   private nonceManager: NonceManager;
   private liquidatorAbi = parseAbi([
@@ -50,9 +57,9 @@ export class LiquidationExecutor {
       throw new Error('Liquidator contract address not configured');
     }
   }
-  
+
   /**
-   * Initialize nonce manager (call once at startup)
+   * @notice Initialize nonce manager (call once at startup)
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
@@ -75,10 +82,7 @@ export class LiquidationExecutor {
     debtToCover: bigint
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
-    
-    // Get nonce from NonceManager (thread-safe)
     const { nonce, release } = await this.nonceManager.getNextNonce();
-    
     try {
       logger.info(`Executing liquidation for ${user} with nonce ${nonce}`, {
         collateral: collateralAsset,
@@ -88,22 +92,18 @@ export class LiquidationExecutor {
       });
       const fixedGasLimit = 920000n;
       const gasSettings = await this.gasManager.getOptimalGasSettings(fixedGasLimit);
-      
-      // CRITICAL: Explicitly pass nonce to prevent auto-fetch race condition
       const hash = await this.walletClient.writeContract({
         address: config.liquidator.address as Address,
         abi: this.liquidatorAbi,
         functionName: 'executeLiquidation',
         args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
         account: this.account,
-        nonce: nonce,  // ← EXPLICIT NONCE (prevents race condition)
+        nonce: nonce,
         maxFeePerGas: gasSettings.maxFeePerGas,
         maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
         gas: gasSettings.gas,
         chain: base,
       });
-      
-      // Nonce successfully broadcasted, confirm it
       this.nonceManager.confirmNonce(nonce);
       
       logger.info(`Transaction sent: ${hash} (nonce: ${nonce})`);
@@ -122,12 +122,10 @@ export class LiquidationExecutor {
         throw new Error('Transaction reverted');
       }
     } catch (error: any) {
-      // Release nonce if TX failed before broadcast
       if (!error.message?.includes('transaction hash') && !error.message?.includes('already known')) {
         release();
         logger.warn(`Released nonce ${nonce} due to failed TX`);
       }
-      
       logger.error('Liquidation execution failed:', error);
       this.stats.failedLiquidations++;
       this.stats.consecutiveLosses++;
@@ -176,7 +174,6 @@ export class LiquidationExecutor {
 
   /**
    * @notice Get wallet address
-   * @dev Returns account address
    * @return Wallet address
    */
   getAddress(): string {

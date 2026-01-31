@@ -13,6 +13,7 @@ import { SupportedAsset } from './config/assets';
 
 class LiquidatorBot {
   private rpcUrl: string;
+  private publicClient: any;
   private account: ReturnType<typeof createAccount>;
   private healthChecker: HealthChecker;
   private executor: LiquidationExecutor;
@@ -29,14 +30,14 @@ class LiquidatorBot {
 
   constructor() {
     this.rpcUrl = config.network.rpcUrl;
-    const publicClient = createPublicClient({
+    this.publicClient = createPublicClient({
       chain: base,
       transport: http(config.network.rpcUrl),
     });
     this.account = createAccount();
     this.healthChecker = new HealthChecker(config.network.rpcUrl, config.aave.pool);
     this.executor = new LiquidationExecutor(config.network.rpcUrl, this.account);
-    this.priceOracle = new PriceOracle(publicClient);
+    this.priceOracle = new PriceOracle(this.publicClient);
     this.subgraphService = new SubgraphService(config.aave.subgraphUrl);
     this.optimizedLiquidation = new OptimizedLiquidationService(
       config.network.rpcUrl,
@@ -223,13 +224,9 @@ class LiquidatorBot {
    * @dev Checks network ID matches config, logs block number and wallet balance
    */
   private async checkConnection(): Promise<void> {
-    const publicClient = createPublicClient({
-      chain: base,
-      transport: http(this.rpcUrl),
-    });
-    const chainId = await publicClient.getChainId();
-    const blockNumber = await publicClient.getBlockNumber();
-    const balance = await publicClient.getBalance({ address: this.account.address });
+    const chainId = await this.publicClient.getChainId();
+    const blockNumber = await this.publicClient.getBlockNumber();
+    const balance = await this.publicClient.getBalance({ address: this.account.address });
     logger.info(`Connected to network: Base (Chain ID: ${chainId})`);
     logger.info(`Current block: ${blockNumber}`);
     logger.info(`Wallet balance: ${formatEther(balance)} ETH`);

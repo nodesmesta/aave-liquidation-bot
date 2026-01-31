@@ -1,14 +1,6 @@
 import { PublicClient } from 'viem';
 import { logger } from '../utils/logger';
 
-/**
- * NonceManager: Thread-safe nonce management for parallel transactions
- * 
- * Problem: Viem's auto-nonce fetches from RPC every time, causing race conditions
- * when multiple transactions execute simultaneously.
- * 
- * Solution: Track nonce locally with mutex-like behavior using promises.
- */
 export class NonceManager {
   private currentNonce: number | null = null;
   private initPromise: Promise<void> | null = null;
@@ -18,9 +10,9 @@ export class NonceManager {
     private publicClient: PublicClient,
     private walletAddress: `0x${string}`
   ) {}
-  
+
   /**
-   * Initialize nonce from blockchain (call once at startup)
+   * @notice Initialize nonce from blockchain (call once at startup)
    */
   async initialize(): Promise<void> {
     if (this.initPromise) {
@@ -38,27 +30,23 @@ export class NonceManager {
     
     return this.initPromise;
   }
-  
+
   /**
-   * Get next available nonce (thread-safe)
-   * Returns nonce and a callback to release it if TX fails
+   * @notice Get next available nonce (thread-safe)
+   * @return Object with nonce and release callback for failed transactions
    */
   async getNextNonce(): Promise<{
     nonce: number;
     release: () => void;
   }> {
-    // Ensure initialized
     if (this.currentNonce === null) {
       await this.initialize();
     }
-    
     const nonce = this.currentNonce!;
-    this.currentNonce!++; // Increment for next call
+    this.currentNonce!++;
     this.pendingNonces.add(nonce);
     
     logger.debug(`[NonceManager] Allocated nonce: ${nonce} (pending: ${this.pendingNonces.size})`);
-    
-    // Release callback (if TX fails before broadcast)
     const release = () => {
       this.pendingNonces.delete(nonce);
       logger.debug(`[NonceManager] Released nonce: ${nonce}`);
@@ -66,17 +54,18 @@ export class NonceManager {
     
     return { nonce, release };
   }
-  
+
   /**
-   * Mark nonce as confirmed (TX successfully broadcasted)
+   * @notice Mark nonce as confirmed (TX successfully broadcasted)
+   * @param nonce The nonce to confirm
    */
   confirmNonce(nonce: number): void {
     this.pendingNonces.delete(nonce);
     logger.debug(`[NonceManager] Confirmed nonce: ${nonce} (pending: ${this.pendingNonces.size})`);
   }
-  
+
   /**
-   * Sync with blockchain (call if nonce mismatch detected)
+   * @notice Sync with blockchain (call if nonce mismatch detected)
    */
   async resync(): Promise<void> {
     const onchainNonce = await this.publicClient.getTransactionCount({
@@ -90,9 +79,10 @@ export class NonceManager {
     
     logger.warn(`[NonceManager] Resynced nonce: ${oldNonce} → ${onchainNonce}`);
   }
-  
+
   /**
-   * Get current state (for debugging)
+   * @notice Get current state (for debugging)
+   * @return Object with current nonce and pending nonces array
    */
   getState(): { current: number | null; pending: number[] } {
     return {
