@@ -68,18 +68,20 @@ export class LiquidationExecutor {
 
   /**
    * @notice Execute liquidation with simplified parameters
-   * @dev Uses EIP-1559 gas with urgent mode (1.5x priority), includes circuit breaker
+   * @dev Uses EIP-1559 gas with dynamic priority fee based on liquidation value
    * @param collateralAsset Address of collateral asset to seize
    * @param debtAsset Address of debt asset to repay
    * @param user Address of user to liquidate
    * @param debtToCover Amount of debt to cover
+   * @param estimatedValue Estimated liquidation value in USD for dynamic gas pricing
    * @return Execution result with success status, txHash, and gas used
    */
   async executeLiquidation(
     collateralAsset: string,
     debtAsset: string,
     user: string,
-    debtToCover: bigint
+    debtToCover: bigint,
+    estimatedValue: number
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
@@ -91,7 +93,7 @@ export class LiquidationExecutor {
         nonce,
       });
       const fixedGasLimit = 920000n;
-      const gasSettings = await this.gasManager.getOptimalGasSettings(fixedGasLimit);
+      const gasSettings = await this.gasManager.getOptimalGasSettings(fixedGasLimit, estimatedValue);
       const hash = await this.walletClient.writeContract({
         address: config.liquidator.address as Address,
         abi: this.liquidatorAbi,

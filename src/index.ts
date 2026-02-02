@@ -50,17 +50,14 @@ class LiquidatorBot {
 
   /**
    * @notice Initialize user pool from Subgraph and on-chain validation
-   * @dev Queries USDC borrowers, validates HF < 1.1, filters hedged positions
+   * @dev Queries USDC borrowers, validates HF < 1.05
    */
   async initialize(): Promise<void> {
     try {
       logger.info('Initializing liquidation bot...');
-      logger.info('Strategy: USDC debt users + on-chain validation (HF < 1.1)');
-      
-      // Initialize NonceManager (critical for parallel execution)
+      logger.info('Strategy: USDC debt users + on-chain validation (HF < 1.05)');
       await this.executor.initialize();
       logger.info('NonceManager initialized for thread-safe parallel execution');
-      
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No liquidation candidates found from Subgraph');
@@ -76,11 +73,11 @@ class LiquidatorBot {
         config.aave.protocolDataProvider
       );
       if (validationResults.size === 0) {
-        logger.warn('No critical risk users (HF < 1.1) found on-chain');
+        logger.warn('No critical risk users (HF < 1.05) found on-chain');
         this.isInitialized = true;
         return;
       }
-      logger.info(`Found ${validationResults.size} critical risk users (HF < 1.1)`);
+      logger.info(`Found ${validationResults.size} critical risk users (HF < 1.05)`);
       for (const [address, data] of validationResults.entries()) {
         const collateralSymbols = data.collateralAssets.map(addr => getAssetSymbol(addr) || addr);
         this.userPool.addUser({
@@ -339,16 +336,16 @@ class LiquidatorBot {
     let removedCount = 0;
     for (const [address, health] of healthMap.entries()) {
       const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
-      if (health.healthFactor >= 1.1) {
+      if (health.healthFactor >= 1.05) {
         this.userPool.removeUser(address);
         removedCount++;
-        logger.debug(`Removed ${shortAddress} from pool (HF ${health.healthFactor.toFixed(4)} >= 1.1 threshold)`);
+        logger.debug(`Removed ${shortAddress} from pool (HF ${health.healthFactor.toFixed(4)} >= 1.05 threshold)`);
       } else {
         this.userPool.updateUserHF(address, health.healthFactor);
       }
     }
     if (removedCount > 0) {
-      logger.info(`Removed ${removedCount} recovered users from pool (HF >= 1.1)`);
+      logger.info(`Removed ${removedCount} recovered users from pool (HF >= 1.05)`);
     }
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
@@ -373,41 +370,27 @@ class LiquidatorBot {
   private async selectBestLiquidation(
     users: UserHealth[]
   ): Promise<{ user: UserHealth; params: LiquidationParams } | null> {
-    const results = await Promise.all(
-      users.map(async (user) => {
-        try {
-          const params = await this.optimizedLiquidation.getLiquidationParams(user);
-          if (!params) return null;
-          return { user, params, score: this.calculateLiquidationScore(params, user) };
-        } catch {
-          return null;
+    const sortedUsers = users.sort((a, b) => a.healthFactor - b.healthFactor);
+    for (const user of sortedUsers) {
+      try {
+        const params = await this.optimizedLiquidation.getLiquidationParams(user);
+        if (!params) continue;
+        if (params.estimatedValue >= 100) {
+          logger.info(
+            `Selected: ${params.collateralSymbol}→${params.debtSymbol} ` +
+            `(HF: ${user.healthFactor.toFixed(4)}, value: $${params.estimatedValue.toFixed(0)})`
+          );
+          return { user, params };
+        } else {
+          logger.debug(`Skipping ${user.user} - value $${params.estimatedValue.toFixed(0)} < $100 minimum`);
         }
-      })
-    );
-    
-    const valid = results.filter(r => r !== null) as Array<{
-      user: UserHealth;
-      params: LiquidationParams;
-      score: number;
-    }>;
-    
-    if (valid.length === 0) return null;
-    
-    valid.sort((a, b) => b.score - a.score);
-    const best = valid[0];
-    logger.info(
-      `Selected: ${best.params.collateralSymbol}→${best.params.debtSymbol} ` +
-      `(bonus: ${best.params.liquidationBonus}%, $${best.params.estimatedValue.toFixed(0)})`
-    );
-    return { user: best.user, params: best.params };
-  }
-
-  private calculateLiquidationScore(params: LiquidationParams, userHealth: UserHealth): number {
-    return (
-      params.liquidationBonus * 40 + 
-      Math.min(params.estimatedValue / 100, 30) +
-      Math.max(0, 1.0 - userHealth.healthFactor) * 300
-    );
+      } catch (error) {
+        logger.debug(`Failed to get params for ${user.user}:`, error);
+        continue;
+      }
+    }
+    logger.warn('No liquidatable users with value >= $100 found');
+    return null;
   }
 
   private async executeLiquidationWithParams(
@@ -420,7 +403,8 @@ class LiquidatorBot {
         params.collateralAsset,
         params.debtAsset,
         params.userAddress,
-        params.debtToCover
+        params.debtToCover,
+        params.estimatedValue
       );
       if (tx.success) {
         logger.info(`Liquidated: ${tx.txHash}`);
@@ -431,26 +415,8 @@ class LiquidatorBot {
       this.inFlightLiquidations.delete(userHealth.user);
     }
   }
-
-  /**
-   * @notice Log current bot status and liquidation statistics
-   * @dev Displays network info, wallet address, and executor stats
-   */
-  private logStatus(): void {
-    const stats = this.executor.getStats();
-    logger.info('Bot Status');
-    logger.info(`Network: Base (${base.id})`);
-    logger.info(`Wallet: ${this.account.address}`);
-    logger.info(`Total Attempts: ${stats.totalAttempts}`);
-    logger.info(`Successful: ${stats.successfulLiquidations}`);
-    logger.info(`Success Rate: ${stats.successRate.toFixed(2)}%`);
-  }
 }
 
-/**
- * @notice Main entry point for the liquidator bot
- * @dev Initializes bot, sets up signal handlers (SIGINT, SIGTERM), starts monitoring
- */
 async function main() {
   const bot = new LiquidatorBot();
   process.on('SIGINT', async () => {

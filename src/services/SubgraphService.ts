@@ -161,7 +161,7 @@ export class SubgraphService {
    * @param rpcUrl RPC endpoint URL
    * @param poolAddress Aave V3 Pool contract address
    * @param protocolDataProvider Protocol data provider address
-   * @return Map of user address to health data (HF < 1.1 with unhedged exposure)
+   * @return Map of user address to health data (HF < 1.05)
    */
   async validateUsersOnChain(
     userAddresses: string[],
@@ -249,7 +249,7 @@ export class SubgraphService {
             const totalDebtUSD = Number(totalDebtBase) / 1e8;
             const hf = Number(healthFactor) / 1e18;
             totalValidated++;
-            if (hf < 1.1 && totalDebtUSD >= 2) {
+            if (hf < 1.05 && totalDebtUSD >= 2) {
               atRiskUsers.push({
                 address: batchAddresses[i],
                 hf,
@@ -350,11 +350,7 @@ export class SubgraphService {
           const hasUnhedgedExposure = collateralAssets.some(c => !debtAssets.includes(c)) ||
             debtAssets.some(d => !collateralAssets.includes(d));
           let shouldInclude = false;
-          if (user.hf < 1.03) {
-            shouldInclude = true;
-          } else if (user.hf < 1.05 && hasUnhedgedExposure) {
-            shouldInclude = true;
-          } else if (user.hf < 1.1 && hasUnhedgedExposure && user.debt >= 50) {
+          if (user.hf < 1.05) {
             shouldInclude = true;
           }
           if (shouldInclude) {
@@ -371,7 +367,7 @@ export class SubgraphService {
         }
       }
       logger.info(`Successfully validated ${totalValidated}/${userAddresses.length} users on-chain`);
-      logger.info(`Critical risk users (HF < 1.1): ${results.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
+      logger.info(`Critical risk users (HF < 1.05): ${results.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
       return results;
     } catch (error) {
       logger.error('Error during multicall validation:', error);

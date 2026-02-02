@@ -198,7 +198,7 @@ export class UserPool {
       totalUsers: allUsers.length,
       liquidatable: allUsers.filter(u => u.lastCheckedHF < 1.0).length,
       critical: allUsers.filter(u => u.lastCheckedHF >= 1.0 && u.lastCheckedHF < 1.05).length,
-      warning: allUsers.filter(u => u.lastCheckedHF >= 1.05 && u.lastCheckedHF < 1.1).length,
+      warning: allUsers.filter(u => u.lastCheckedHF >= 1.03 && u.lastCheckedHF < 1.05).length,
       healthy: allUsers.filter(u => u.lastCheckedHF >= 1.1).length,
       totalCollateralUSD: allUsers.reduce((sum, u) => sum + u.collateralUSD, 0),
       totalDebtUSD: allUsers.reduce((sum, u) => sum + u.debtUSD, 0),

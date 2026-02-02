@@ -220,6 +220,7 @@ export class OptimizedLiquidationService {
     if (collaterals.length === 0 || debts.length === 0) {
       return null;
     }
+    
     const allAssets = [...collaterals, ...debts].map(r => r.asset);
     const uniqueAssets = [...new Set(allAssets)];
     const priceMap = await this.priceOracle.getAssetsPrices(uniqueAssets);
