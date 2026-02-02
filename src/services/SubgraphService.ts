@@ -1,6 +1,6 @@
 import { GraphQLClient, gql } from 'graphql-request';
 import { createPublicClient, http, parseAbi, Address } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { logger } from '../utils/logger';
 
 interface UserReserve {
@@ -171,7 +171,7 @@ export class SubgraphService {
   ): Promise<Map<string, { hf: number; collateral: number; debt: number; collateralAssets: string[]; debtAssets: string[] }>> {
     logger.info(`Validating ${userAddresses.length} users on-chain via viem multicall...`);
     const client = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: http(rpcUrl),
     });
     const poolAbi = parseAbi([

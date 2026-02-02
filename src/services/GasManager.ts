@@ -1,3 +1,7 @@
+import { createPublicClient, webSocket } from 'viem';
+import { basePreconf } from 'viem/chains';
+import { logger } from '../utils/logger';
+
 export interface GasSettings {
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
@@ -6,22 +10,101 @@ export interface GasSettings {
 
 export class GasManager {
   private publicClient: any;
+  private wsClient: any = null;
+  private cachedGasPrice: bigint | null = null;
+  private isSubscribed = false;
+  private wssUrl: string;
+  private unsubscribeFn: (() => void) | null = null;
 
-  constructor(publicClient: any) {
+  constructor(publicClient: any, wssUrl: string) {
     this.publicClient = publicClient;
+    this.wssUrl = wssUrl;
+  }
+
+  /**
+   * @notice Initialize WebSocket subscription for gas price updates
+   * @dev Subscribes to new blocks and caches gas price in memory
+   */
+  async initialize(): Promise<void> {
+    try {
+      this.wsClient = createPublicClient({
+        chain: basePreconf,
+        transport: webSocket(this.wssUrl, {
+          keepAlive: true,
+          reconnect: true,
+        }),
+      });
+
+      const initialGasPrice = await this.publicClient.getGasPrice();
+      this.cachedGasPrice = initialGasPrice;
+      logger.info(`GasManager initialized with gas price: ${initialGasPrice.toString()} wei`);
+
+      this.unsubscribeFn = await this.wsClient.watchBlocks({
+        onBlock: async (block: any) => {
+          try {
+            const gasPrice = await this.wsClient.getGasPrice();
+            this.cachedGasPrice = gasPrice;
+          } catch (error) {
+            logger.error('Failed to update gas price from WebSocket:', error);
+          }
+        },
+        onError: (error: Error) => {
+          logger.error('WebSocket gas price subscription error:', error);
+        },
+      });
+
+      this.isSubscribed = true;
+      logger.info('Gas price WebSocket subscription active');
+    } catch (error) {
+      logger.error('Failed to initialize gas price subscription:', error);
+      const fallbackGasPrice = await this.publicClient.getGasPrice();
+      this.cachedGasPrice = fallbackGasPrice;
+      logger.warn('Using fallback RPC mode for gas price');
+    }
+  }
+
+  /**
+   * @notice Get current gas price from cache or fallback to RPC
+   * @dev Uses cached value if available, otherwise queries RPC
+   * @return Current gas price in wei
+   */
+  private async getGasPrice(): Promise<bigint> {
+    if (this.cachedGasPrice !== null) {
+      return this.cachedGasPrice;
+    }
+    logger.warn('Gas price cache miss, fetching from RPC');
+    const gasPrice = await this.publicClient.getGasPrice();
+    this.cachedGasPrice = gasPrice;
+    return gasPrice;
+  }
+
+  /**
+   * @notice Cleanup WebSocket subscription
+   */
+  destroy(): void {
+    if (this.unsubscribeFn) {
+      this.unsubscribeFn();
+      this.unsubscribeFn = null;
+    }
+    this.isSubscribed = false;
+    logger.info('Gas price WebSocket subscription closed');
   }
 
   /**
    * @notice Get optimal gas settings for transaction with dynamic priority fee
-   * @dev Priority fee scales with liquidation value: 1 gwei base + 0.005 gwei per $1
+   * @dev Priority fee scales with liquidation value (includes debt + bonus)
+   *      Formula: 1 gwei + (value-100)*0.005 gwei
    * @param gasLimit Gas limit for the transaction
-   * @param liquidationValueUSD Liquidation value in USD for dynamic fee calculation
+   * @param liquidationValueUSD Liquidation value in USD (debt + bonus = total profitability)
    * @return Gas settings with maxFeePerGas, maxPriorityFeePerGas, and gas
    */
-  async getOptimalGasSettings(gasLimit: bigint, liquidationValueUSD: number): Promise<GasSettings> {
-    const gasPrice = await this.publicClient.getGasPrice();
+  async getOptimalGasSettings(
+    gasLimit: bigint,
+    liquidationValueUSD: number
+  ): Promise<GasSettings> {
+    const gasPrice = await this.getGasPrice();
     const baseFee = gasPrice;
-    const basePriorityFee = 1000000000n;
+    const basePriorityFee = 1_000_000_000n;
     const valueAbove100 = Math.max(0, liquidationValueUSD - 100);
     const additionalPriorityGwei = valueAbove100 * 0.005;
     const additionalPriorityWei = BigInt(Math.floor(additionalPriorityGwei * 1e9));

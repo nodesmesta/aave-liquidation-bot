@@ -1,5 +1,5 @@
 import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { createAccount } from '../utils/wallet';
@@ -26,6 +26,7 @@ export class LiquidationExecutor {
   private publicClient: any; // PublicClient type causes conflicts with multiple viem imports
   private gasManager: GasManager;
   private nonceManager: NonceManager;
+  private wssUrl: string;
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
     'function transferOwnership(address newOwner) external',
@@ -40,18 +41,19 @@ export class LiquidationExecutor {
     consecutiveLosses: 0,
   };
 
-  constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>) {
+  constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>, wssUrl?: string) {
     this.account = account || createAccount();
+    this.wssUrl = wssUrl || rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
     this.walletClient = viemCreateWalletClient({
       account: this.account,
-      chain: base,
+      chain: basePreconf,
       transport: http(rpcUrl),
     });
     this.publicClient = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: http(rpcUrl),
     });
-    this.gasManager = new GasManager(this.publicClient);
+    this.gasManager = new GasManager(this.publicClient, this.wssUrl);
     this.nonceManager = new NonceManager(this.publicClient, this.account.address);
     if (!config.liquidator.address) {
       throw new Error('Liquidator contract address not configured');
@@ -63,7 +65,8 @@ export class LiquidationExecutor {
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
-    logger.info('[LiquidationExecutor] Initialized with nonce manager');
+    await this.gasManager.initialize();
+    logger.info('[LiquidationExecutor] Initialized with nonce manager and gas price subscription');
   }
 
   /**
@@ -73,7 +76,7 @@ export class LiquidationExecutor {
    * @param debtAsset Address of debt asset to repay
    * @param user Address of user to liquidate
    * @param debtToCover Amount of debt to cover
-   * @param estimatedValue Estimated liquidation value in USD for dynamic gas pricing
+   * @param estimatedValue Estimated liquidation value in USD (debt + bonus)
    * @return Execution result with success status, txHash, and gas used
    */
   async executeLiquidation(
@@ -93,7 +96,10 @@ export class LiquidationExecutor {
         nonce,
       });
       const fixedGasLimit = 920000n;
-      const gasSettings = await this.gasManager.getOptimalGasSettings(fixedGasLimit, estimatedValue);
+      const gasSettings = await this.gasManager.getOptimalGasSettings(
+        fixedGasLimit,
+        estimatedValue
+      );
       const hash = await this.walletClient.writeContract({
         address: config.liquidator.address as Address,
         abi: this.liquidatorAbi,
@@ -104,7 +110,7 @@ export class LiquidationExecutor {
         maxFeePerGas: gasSettings.maxFeePerGas,
         maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
         gas: gasSettings.gas,
-        chain: base,
+        chain: basePreconf,
       });
       this.nonceManager.confirmNonce(nonce);
       
@@ -168,7 +174,7 @@ export class LiquidationExecutor {
       functionName: 'transferOwnership',
       args: [newOwner as Address],
       account: this.account,
-      chain: base,
+      chain: basePreconf,
     });
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);

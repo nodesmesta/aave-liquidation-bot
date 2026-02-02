@@ -1,6 +1,6 @@
 import { createWalletClient as viemCreateWalletClient, http } from 'viem';
 import { privateKeyToAccount, mnemonicToAccount, PrivateKeyAccount } from 'viem/accounts';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 
 /**
@@ -28,7 +28,7 @@ export function createWalletClient(rpcUrl: string) {
   const account = createAccount();
   return viemCreateWalletClient({
     account,
-    chain: base,
+    chain: basePreconf,
     transport: http(rpcUrl),
   });
 }

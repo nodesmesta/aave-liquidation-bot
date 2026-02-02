@@ -1,5 +1,5 @@
 import { createPublicClient, http, parseAbi, Address } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -25,7 +25,7 @@ export class HealthChecker {
     const resolvedRpcUrl = rpcUrl || config.network.rpcUrl;
     this.poolAddress = poolAddress || config.aave.pool;
     this.publicClient = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: http(resolvedRpcUrl),
     });
   }

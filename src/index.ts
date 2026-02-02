@@ -1,5 +1,5 @@
 import { createPublicClient, http, formatEther, formatUnits } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { config, validateConfig, getAssetSymbol } from './config';
 import { logger } from './utils/logger';
 import { createAccount } from './utils/wallet';
@@ -29,16 +29,21 @@ class LiquidatorBot {
   private pendingUserChecks: Set<string> = new Set();
   private inFlightLiquidations: Set<string> = new Set();
   private static usingPrimaryWss = true;
+  private priceUpdateTimestamp: number = 0;
 
   constructor() {
     this.rpcUrl = config.network.rpcUrl;
     this.publicClient = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: http(config.network.rpcUrl),
     });
     this.account = createAccount();
     this.healthChecker = new HealthChecker(config.network.rpcUrl, config.aave.pool);
-    this.executor = new LiquidationExecutor(config.network.rpcUrl, this.account);
+    this.executor = new LiquidationExecutor(
+      config.network.rpcUrl,
+      this.account,
+      config.network.wssUrl
+    );
     this.priceOracle = new PriceOracle(this.publicClient);
     this.subgraphService = new SubgraphService(config.aave.subgraphUrl);
     this.optimizedLiquidation = new OptimizedLiquidationService(
@@ -58,6 +63,7 @@ class LiquidatorBot {
       logger.info('Strategy: USDC debt users + on-chain validation (HF < 1.05)');
       await this.executor.initialize();
       logger.info('NonceManager initialized for thread-safe parallel execution');
+      logger.info('Gas price WebSocket subscription initialized');
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No liquidation candidates found from Subgraph');
@@ -230,8 +236,8 @@ class LiquidatorBot {
     logger.info(`Connected to network: Base (Chain ID: ${chainId})`);
     logger.info(`Current block: ${blockNumber}`);
     logger.info(`Wallet balance: ${formatEther(balance)} ETH`);
-    if (Number(chainId) !== base.id) {
-      throw new Error(`Wrong network! Expected ${base.id}, got ${chainId}`);
+    if (Number(chainId) !== basePreconf.id) {
+      throw new Error(`Wrong network! Expected ${basePreconf.id}, got ${chainId}`);
     }
   }
 
@@ -277,6 +283,7 @@ class LiquidatorBot {
   private async handlePriceChange(updates: PriceUpdate[]): Promise<void> {
     if (updates.length === 0) return;
     if (!this.isInitialized || this.isRestarting) return;
+    this.priceUpdateTimestamp = Date.now();
     for (const update of updates) {
       const assetSymbol = getAssetSymbol(update.asset);
       const usersWithCollateral = this.userPool.getUsersWithCollateral(assetSymbol);
@@ -332,7 +339,9 @@ class LiquidatorBot {
    */
   private async checkTrackedUsers(userAddresses: string[]): Promise<void> {
     if (userAddresses.length === 0) return;
+    const healthCheckStart = Date.now();
     const healthMap = await this.healthChecker.checkUsers(userAddresses);
+    const healthCheckLatency = Date.now() - healthCheckStart;
     let removedCount = 0;
     for (const [address, health] of healthMap.entries()) {
       const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
@@ -349,7 +358,7 @@ class LiquidatorBot {
     }
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
-      logger.info(`Found ${liquidatable.length} liquidatable users`);
+      logger.info(`Found ${liquidatable.length} liquidatable users (health check: ${healthCheckLatency}ms)`);
       const availableUsers = liquidatable.filter(userHealth => {
         if (this.inFlightLiquidations.has(userHealth.user)) {
           logger.debug(`Skipping ${userHealth.user} - already being liquidated`);
@@ -370,27 +379,26 @@ class LiquidatorBot {
   private async selectBestLiquidation(
     users: UserHealth[]
   ): Promise<{ user: UserHealth; params: LiquidationParams } | null> {
-    const sortedUsers = users.sort((a, b) => a.healthFactor - b.healthFactor);
-    for (const user of sortedUsers) {
-      try {
-        const params = await this.optimizedLiquidation.getLiquidationParams(user);
-        if (!params) continue;
-        if (params.estimatedValue >= 100) {
-          logger.info(
-            `Selected: ${params.collateralSymbol}→${params.debtSymbol} ` +
-            `(HF: ${user.healthFactor.toFixed(4)}, value: $${params.estimatedValue.toFixed(0)})`
-          );
-          return { user, params };
-        } else {
-          logger.debug(`Skipping ${user.user} - value $${params.estimatedValue.toFixed(0)} < $100 minimum`);
-        }
-      } catch (error) {
-        logger.debug(`Failed to get params for ${user.user}:`, error);
-        continue;
-      }
+    const paramsStart = Date.now();
+    const paramsMap = await this.optimizedLiquidation.getLiquidationParamsForMultipleUsers(users);
+    const paramsLatency = Date.now() - paramsStart;
+    if (paramsMap.size === 0) {
+      logger.warn('No valid liquidations found (all users failed validation or value < $100)');
+      return null;
     }
-    logger.warn('No liquidatable users with value >= $100 found');
-    return null;
+    const validLiquidations = Array.from(paramsMap.values());
+    validLiquidations.sort((a, b) => {
+      const valueDiff = b.params.estimatedValue - a.params.estimatedValue;
+      if (Math.abs(valueDiff) > 50) return valueDiff;
+      return a.userHealth.healthFactor - b.userHealth.healthFactor;
+    });
+    const best = validLiquidations[0];
+    logger.info(
+      `Selected best of ${validLiquidations.length} valid liquidations: ` +
+      `${best.params.collateralSymbol}→${best.params.debtSymbol} ` +
+      `(HF: ${best.userHealth.healthFactor.toFixed(4)}, value: $${best.params.estimatedValue.toFixed(0)}, params: ${paramsLatency}ms)`
+    );
+    return { user: best.userHealth, params: best.params };
   }
 
   private async executeLiquidationWithParams(
@@ -399,6 +407,7 @@ class LiquidatorBot {
   ): Promise<boolean> {
     this.inFlightLiquidations.add(userHealth.user);
     try {
+      const executionStart = Date.now();
       const tx = await this.executor.executeLiquidation(
         params.collateralAsset,
         params.debtAsset,
@@ -406,8 +415,14 @@ class LiquidatorBot {
         params.debtToCover,
         params.estimatedValue
       );
+      const executionLatency = Date.now() - executionStart;
+      const totalLatency = Date.now() - this.priceUpdateTimestamp;
       if (tx.success) {
-        logger.info(`Liquidated: ${tx.txHash}`);
+        logger.info(
+          `✓ Liquidated: ${tx.txHash} | ` +
+          `Execution: ${executionLatency}ms | ` +
+          `Total (price→tx): ${totalLatency}ms`
+        );
         return true;
       }
       return false;

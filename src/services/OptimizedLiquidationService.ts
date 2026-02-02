@@ -1,5 +1,5 @@
 import { createPublicClient, http, parseAbi, Address, formatUnits } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { logger } from '../utils/logger';
 import { UserHealth } from './HealthChecker';
 import { PriceOracle } from './PriceOracle';
@@ -22,6 +22,7 @@ export interface LiquidationParams {
   debtAsset: string;
   debtSymbol: string;
   debtToCover: bigint;
+  debtToCoverUSD: number;
   liquidationBonus: number;
   estimatedValue: number;
 }
@@ -66,7 +67,7 @@ export class OptimizedLiquidationService {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
     this.publicClient = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: http(rpcUrl),
     });
     this.priceOracle = new PriceOracle(this.publicClient);
@@ -122,94 +123,9 @@ export class OptimizedLiquidationService {
     logger.debug(`Cached ${this.reservesCache.length} reserves`);
     return this.reservesCache;
   }
-
-  /**
-   * @notice Get user's active reserves with configuration data
-   * @dev Optimized: Only fetches data for reserves user actually uses (via bitmap filtering)
-   * @param userAddress Address of the user to query
-   * @return Array of user's active reserves with balance and config data
-   */
-  async getUserReservesWithConfigs(userAddress: string): Promise<UserReserveData[]> {
-    const bitmapResult = await this.publicClient.readContract({
-      address: this.poolAddress as Address,
-      abi: this.poolAbi,
-      functionName: 'getUserConfiguration',
-      args: [userAddress as Address],
-    });
-    const bitmap = bitmapResult as bigint;
-    const { allActiveIds } = this.decodeBitmap(bitmap);
-    if (allActiveIds.length === 0) {
-      return [];
-    }
-    const allReserves = await this.getAllReserves();
-    const contracts: any[] = [];
-    const activeReserves: Array<{ id: number; symbol: string; address: string }> = [];
-    for (const reserveId of allActiveIds) {
-      if (reserveId >= allReserves.length) {
-        logger.warn(`Reserve ID ${reserveId} out of bounds (max: ${allReserves.length - 1})`);
-        continue;
-      }
-      const reserve = allReserves[reserveId];
-      activeReserves.push({ id: reserveId, ...reserve });
-      contracts.push({
-        address: this.protocolDataProvider as Address,
-        abi: this.dataProviderAbi,
-        functionName: 'getUserReserveData',
-        args: [reserve.address as Address, userAddress as Address],
-      });
-      contracts.push({
-        address: this.protocolDataProvider as Address,
-        abi: this.dataProviderAbi,
-        functionName: 'getReserveConfigurationData',
-        args: [reserve.address as Address],
-      });
-    }
-
-    const results = await this.publicClient.multicall({ contracts });
-    const userReserves: UserReserveData[] = [];
-    for (let i = 0; i < activeReserves.length; i++) {
-      const userDataIndex = i * 2;
-      const configDataIndex = i * 2 + 1;
-      const userDataResult = results[userDataIndex];
-      const configDataResult = results[configDataIndex];
-      if (userDataResult.status !== 'success' || configDataResult.status !== 'success') {
-        continue;
-      }
-      const userData = userDataResult.result as any[];
-      const configData = configDataResult.result as any[];
-      const collateralBalance = BigInt(userData[0].toString());
-      const stableDebt = BigInt(userData[1].toString());
-      const variableDebt = BigInt(userData[2].toString());
-      const debtBalance = stableDebt + variableDebt;
-      const usageAsCollateralEnabled = userData[8] as boolean;
-      
-      if (collateralBalance === 0n && debtBalance === 0n) {
-        continue;
-      }
-      
-      const decimals = Number(configData[0]);
-      const liquidationBonusRaw = Number(configData[3]);
-      const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
-      userReserves.push({
-        asset: activeReserves[i].address,
-        symbol: activeReserves[i].symbol,
-        decimals,
-        collateralBalance,
-        debtBalance,
-        usageAsCollateralEnabled,
-        liquidationBonus,
-      });
-    }
-    logger.info(
-      `Found ${userReserves.length} reserves with balances ` +
-      `(fetched ${activeReserves.length}/${allReserves.length} reserves, ` +
-      `saved ${((1 - activeReserves.length / allReserves.length) * 100).toFixed(1)}% RPC calls)`
-    );
-    return userReserves;
-  }
-
   async selectBestPair(
-    userReserves: UserReserveData[]
+    userReserves: UserReserveData[],
+    priceCache?: Map<string, number>
   ): Promise<{ collateral: UserReserveData; debt: UserReserveData } | null> {
     const collaterals = userReserves.filter(
       r => r.collateralBalance > 0n && 
@@ -221,9 +137,14 @@ export class OptimizedLiquidationService {
       return null;
     }
     
-    const allAssets = [...collaterals, ...debts].map(r => r.asset);
-    const uniqueAssets = [...new Set(allAssets)];
-    const priceMap = await this.priceOracle.getAssetsPrices(uniqueAssets);
+    let priceMap: Map<string, number>;
+    if (priceCache) {
+      priceMap = priceCache;
+    } else {
+      const allAssets = [...collaterals, ...debts].map(r => r.asset);
+      const uniqueAssets = [...new Set(allAssets)];
+      priceMap = await this.priceOracle.getAssetsPrices(uniqueAssets);
+    }
     const validPairs: Array<{ collateral: UserReserveData; debt: UserReserveData; bonus: number }> = [];
     for (const collateral of collaterals) {
       for (const debt of debts) {
@@ -275,16 +196,23 @@ export class OptimizedLiquidationService {
    * @param collateral Collateral reserve data from protocol
    * @param debt Debt reserve data from protocol
    * @param healthFactor User's current health factor
+   * @param priceCache Optional pre-fetched price map to avoid redundant RPC calls
    * @return Complete liquidation parameters for execution
    */
   async prepareLiquidationParams(
     userAddress: string,
     collateral: UserReserveData,
     debt: UserReserveData,
-    healthFactor: number
+    healthFactor: number,
+    priceCache?: Map<string, number>
   ): Promise<LiquidationParams | null> {
     const totalDebt = debt.debtBalance;
-    const priceMap = await this.priceOracle.getAssetsPrices([collateral.asset, debt.asset]);
+    let priceMap: Map<string, number>;
+    if (priceCache) {
+      priceMap = priceCache;
+    } else {
+      priceMap = await this.priceOracle.getAssetsPrices([collateral.asset, debt.asset]);
+    }
     const collateralPrice = priceMap.get(collateral.asset);
     const debtPrice = priceMap.get(debt.asset);
 
@@ -310,12 +238,13 @@ export class OptimizedLiquidationService {
       return null;
     }
     const debtValue = parseFloat(formatUnits(debtToCover, debt.decimals));
+    const debtToCoverUSD = debtValue * debtPrice;
     const estimatedValue = debtValue * liquidationBonusMultiplier;
 
     logger.info(
       `Liquidation calc: totalDebt=${formatUnits(totalDebt, debt.decimals)}, ` +
       `maxByCollateral=${maxDebtByCollateral.toFixed(4)}, ` +
-      `final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol}`
+      `final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`
     );
     
     return {
@@ -325,34 +254,153 @@ export class OptimizedLiquidationService {
       debtAsset: debt.asset,
       debtSymbol: debt.symbol,
       debtToCover,
+      debtToCoverUSD,
       liquidationBonus: collateral.liquidationBonus,
       estimatedValue,
     };
   }
-
   /**
-   * @notice Get complete liquidation parameters for a user
-   * @dev Orchestrates: bitmap filtering → data fetching → pair selection → param preparation
-   * @param userHealth User's health data including address and health factor
-   * @return Complete liquidation parameters, or null if no suitable opportunity
+   * @notice Get liquidation params for multiple users in parallel using multicall
+   * @dev Optimized: Fetches bitmaps + prices in 1 multicall, then reserves in 2nd multicall
+   * @param users Array of user health data
+   * @return Map of user address to liquidation params (only includes valid liquidations)
    */
-  async getLiquidationParams(
-    userHealth: UserHealth
-  ): Promise<LiquidationParams | null> {
-    const userReserves = await this.getUserReservesWithConfigs(userHealth.user);
-    if (userReserves.length === 0) {
-      return null;
+  async getLiquidationParamsForMultipleUsers(
+    users: UserHealth[]
+  ): Promise<Map<string, { params: LiquidationParams; userHealth: UserHealth }>> {
+    if (users.length === 0) return new Map();
+    const startTime = Date.now();
+    const allReserves = await this.getAllReserves();
+    const allUniqueAssets = new Set<string>();
+    for (const reserve of allReserves) {
+      allUniqueAssets.add(reserve.address);
     }
-    const bestPair = await this.selectBestPair(userReserves);
-    if (!bestPair) {
-      return null;
+    const bitmapContracts = users.map(user => ({
+      address: this.poolAddress as Address,
+      abi: this.poolAbi,
+      functionName: 'getUserConfiguration',
+      args: [user.user as Address],
+    }));
+    const priceContract = {
+      address: this.priceOracle['AAVE_ORACLE'] as Address,
+      abi: this.priceOracle['ORACLE_ABI'],
+      functionName: 'getAssetsPrices',
+      args: [[...allUniqueAssets] as `0x${string}`[]],
+    };
+    const combinedResults = await this.publicClient.multicall({ 
+      contracts: [...bitmapContracts, priceContract]
+    });
+    const bitmapResults = combinedResults.slice(0, users.length);
+    const pricesResult = combinedResults[users.length];
+    let priceCache = new Map<string, number>();
+    if (pricesResult.status === 'success') {
+      const prices = pricesResult.result as bigint[];
+      const assetArray = [...allUniqueAssets];
+      assetArray.forEach((asset, index) => {
+        const price = parseFloat(formatUnits(prices[index], 8));
+        priceCache.set(asset, price);
+      });
     }
-    const params = this.prepareLiquidationParams(
-      userHealth.user,
-      bestPair.collateral,
-      bestPair.debt,
-      userHealth.healthFactor
+    const reserveDataContracts: any[] = [];
+    const userReserveMap: Map<string, { ids: number[]; startIndex: number; count: number }> = new Map();
+    let currentIndex = 0;
+    for (let i = 0; i < users.length; i++) {
+      const bitmapResult = bitmapResults[i];
+      if (bitmapResult.status !== 'success') continue;
+      const bitmap = bitmapResult.result as bigint;
+      const { allActiveIds } = this.decodeBitmap(bitmap);
+      if (allActiveIds.length === 0) continue;
+      const validIds = allActiveIds.filter(id => id < allReserves.length);
+      if (validIds.length === 0) continue;
+      userReserveMap.set(users[i].user, {
+        ids: validIds,
+        startIndex: currentIndex,
+        count: validIds.length * 2,
+      });
+      for (const reserveId of validIds) {
+        const reserve = allReserves[reserveId];
+        reserveDataContracts.push({
+          address: this.protocolDataProvider as Address,
+          abi: this.dataProviderAbi,
+          functionName: 'getUserReserveData',
+          args: [reserve.address as Address, users[i].user as Address],
+        });
+        reserveDataContracts.push({
+          address: this.protocolDataProvider as Address,
+          abi: this.dataProviderAbi,
+          functionName: 'getReserveConfigurationData',
+          args: [reserve.address as Address],
+        });
+      }
+      currentIndex += validIds.length * 2;
+    }
+    if (reserveDataContracts.length === 0) {
+      logger.debug('No active reserves found for any user');
+      return new Map();
+    }
+    const reserveDataResults = await this.publicClient.multicall({ contracts: reserveDataContracts });
+    const allUserReservesMap = new Map<string, UserReserveData[]>();
+    for (const userHealth of users) {
+      const userMapping = userReserveMap.get(userHealth.user);
+      if (!userMapping) continue;
+      const userReserves: UserReserveData[] = [];
+      for (let i = 0; i < userMapping.ids.length; i++) {
+        const reserveId = userMapping.ids[i];
+        const userDataIndex = userMapping.startIndex + i * 2;
+        const configDataIndex = userMapping.startIndex + i * 2 + 1;
+        const userDataResult = reserveDataResults[userDataIndex];
+        const configDataResult = reserveDataResults[configDataIndex];
+        if (userDataResult.status !== 'success' || configDataResult.status !== 'success') {
+          continue;
+        }
+        const userData = userDataResult.result as any[];
+        const configData = configDataResult.result as any[];
+        const collateralBalance = BigInt(userData[0].toString());
+        const stableDebt = BigInt(userData[1].toString());
+        const variableDebt = BigInt(userData[2].toString());
+        const debtBalance = stableDebt + variableDebt;
+        const usageAsCollateralEnabled = userData[8] as boolean;
+        if (collateralBalance === 0n && debtBalance === 0n) continue;
+        const reserve = allReserves[reserveId];
+        const decimals = Number(configData[0]);
+        const liquidationBonusRaw = Number(configData[3]);
+        const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
+        userReserves.push({
+          asset: reserve.address,
+          symbol: reserve.symbol,
+          decimals,
+          collateralBalance,
+          debtBalance,
+          usageAsCollateralEnabled,
+          liquidationBonus,
+        });
+      }
+      if (userReserves.length > 0) {
+        allUserReservesMap.set(userHealth.user, userReserves);
+      }
+    }
+    const resultMap = new Map<string, { params: LiquidationParams; userHealth: UserHealth }>();
+    for (const userHealth of users) {
+      const userReserves = allUserReservesMap.get(userHealth.user);
+      if (!userReserves) continue;
+      const bestPair = await this.selectBestPair(userReserves, priceCache);
+      if (!bestPair) continue;
+      const params = await this.prepareLiquidationParams(
+        userHealth.user,
+        bestPair.collateral,
+        bestPair.debt,
+        userHealth.healthFactor,
+        priceCache
+      );
+      if (params && params.estimatedValue >= 100) {
+        resultMap.set(userHealth.user, { params, userHealth });
+      }
+    }
+    const elapsed = Date.now() - startTime;
+    logger.info(
+      `Parallel fetch complete: ${users.length} users, ${resultMap.size} valid liquidations, ` +
+      `${reserveDataContracts.length / 2} reserves fetched in ${elapsed}ms (multicall)`
     );
-    return params;
+    return resultMap;
   }
 }

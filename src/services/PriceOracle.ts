@@ -1,5 +1,5 @@
 import { createPublicClient, webSocket, parseAbiItem, formatUnits, http } from 'viem';
-import { base } from 'viem/chains';
+import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -101,7 +101,7 @@ export class PriceOracle {
   private initializeWebSocketClient(wssUrl: string): void {
     if (this.wsClient) return;
     this.wsClient = createPublicClient({
-      chain: base,
+      chain: basePreconf,
       transport: webSocket(wssUrl, {
         keepAlive: true,
         reconnect: true,
