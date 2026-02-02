@@ -162,7 +162,7 @@ export class SubgraphService {
    * @param rpcUrl RPC endpoint URL
    * @param poolAddress Aave V3 Pool contract address
    * @param protocolDataProvider Protocol data provider address
-   * @return Map of user address to health data (HF < 1.05)
+   * @return Map of user address to health data (HF < 1.075)
    */
   async validateUsersOnChain(
     userAddresses: string[],
@@ -283,7 +283,7 @@ export class SubgraphService {
             const totalDebtUSD = Number(totalDebtBase) / 1e8;
             const hf = Number(healthFactor) / 1e18;
             totalValidated++;
-            if (hf < 1.05 && totalDebtUSD >= 2) {
+            if (hf < 1.075 && totalDebtUSD >= 100) {
               atRiskUsers.push({
                 address: batchAddresses[i],
                 hf,
@@ -297,7 +297,7 @@ export class SubgraphService {
         }
       }
       
-      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.05 (filtered ${filteredByHF} healthy users)`);
+      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.075 (filtered ${filteredByHF} healthy users)`);
       
       const atRiskBatches = Math.ceil(atRiskUsers.length / BATCH_SIZE);
       logger.info(`Processing ${atRiskUsers.length} at-risk users in ${atRiskBatches} batches for asset validation...`);
@@ -418,7 +418,7 @@ export class SubgraphService {
           const hasUnhedgedExposure = collateralAssets.some(c => !debtAssets.includes(c)) ||
             debtAssets.some(d => !collateralAssets.includes(d));
           let shouldInclude = false;
-          if (user.hf < 1.05) {
+          if (user.hf < 1.075) {
             shouldInclude = true;
           }
           if (shouldInclude) {
@@ -435,7 +435,7 @@ export class SubgraphService {
         }
       }
       logger.info(`Successfully validated ${totalValidated}/${userAddresses.length} users on-chain`);
-      logger.info(`Critical risk users (HF < 1.05): ${results.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
+      logger.info(`Critical risk users (HF < 1.075): ${results.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
       return results;
     } catch (error) {
       logger.error('Error during multicall validation:', error);

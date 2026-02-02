@@ -345,16 +345,16 @@ class LiquidatorBot {
     let removedCount = 0;
     for (const [address, health] of healthMap.entries()) {
       const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
-      if (health.healthFactor >= 1.05) {
+      if (health.healthFactor >= 1.1) {
         this.userPool.removeUser(address);
         removedCount++;
-        logger.debug(`Removed ${shortAddress} from pool (HF ${health.healthFactor.toFixed(4)} >= 1.05 threshold)`);
+        logger.debug(`Removed ${shortAddress} from pool (HF ${health.healthFactor.toFixed(4)} >= 1.1 threshold)`);
       } else {
         this.userPool.updateUserHF(address, health.healthFactor);
       }
     }
     if (removedCount > 0) {
-      logger.info(`Removed ${removedCount} recovered users from pool (HF >= 1.05)`);
+      logger.info(`Removed ${removedCount} recovered users from pool (HF >= 1.1)`);
     }
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
