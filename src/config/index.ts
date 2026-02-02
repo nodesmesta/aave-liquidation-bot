@@ -42,6 +42,13 @@ export const config = {
   circuitBreaker: {
     maxConsecutiveLosses: parseInt(process.env.MAX_CONSECUTIVE_LOSSES || '3'),
   },
+
+  // Rate Limiting & Batching
+  rateLimit: {
+    batchSize: parseInt(process.env.MULTICALL_BATCH_SIZE || '50'),
+    batchDelayMs: parseInt(process.env.BATCH_DELAY_MS || '100'),
+    maxConcurrentBatches: parseInt(process.env.MAX_CONCURRENT_BATCHES || '5'),
+  },
 };
 
 // Asset configuration is now centralized in ./assets.ts

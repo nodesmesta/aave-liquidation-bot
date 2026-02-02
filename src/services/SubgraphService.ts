@@ -2,6 +2,7 @@ import { GraphQLClient, gql } from 'graphql-request';
 import { createPublicClient, http, parseAbi, Address } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { logger } from '../utils/logger';
+import { config } from '../config';
 
 interface UserReserve {
   reserve: {
@@ -224,22 +225,55 @@ export class SubgraphService {
     }
 
     try {
-      const BATCH_SIZE = 100;
+      const BATCH_SIZE = config.rateLimit.batchSize;
+      const BATCH_DELAY_MS = config.rateLimit.batchDelayMs;
       const atRiskUsers: Array<{ address: string; hf: number; collateral: number; debt: number }> = [];
       const totalBatches = Math.ceil(userAddresses.length / BATCH_SIZE);
+      
+      logger.info(`Processing ${userAddresses.length} users in ${totalBatches} batches (size: ${BATCH_SIZE}, delay: ${BATCH_DELAY_MS}ms)`);
+      
       for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
         const start = batchIndex * BATCH_SIZE;
         const end = Math.min(start + BATCH_SIZE, userAddresses.length);
         const batchAddresses = userAddresses.slice(start, end);
+        
+        // Rate limiting: delay between batches
+        if (batchIndex > 0) {
+          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+        }
+        
+        // Progress logging every 10 batches
+        if (batchIndex % 10 === 0) {
+          logger.info(`Processing batch ${batchIndex + 1}/${totalBatches} (${Math.round((batchIndex / totalBatches) * 100)}%)`);
+        }
+        
         const accountDataCalls = batchAddresses.map(address => ({
           address: poolAddress as Address,
           abi: poolAbi,
           functionName: 'getUserAccountData',
           args: [address as Address],
         }));
-        const accountDataResults = await client.multicall({
-          contracts: accountDataCalls,
-        });
+        
+        let accountDataResults;
+        try {
+          accountDataResults = await client.multicall({
+            contracts: accountDataCalls,
+          });
+        } catch (error: any) {
+          // Handle rate limit errors with exponential backoff
+          if (error.code === 429 || error.message?.includes('compute units')) {
+            const backoffMs = Math.min(BATCH_DELAY_MS * Math.pow(2, batchIndex % 5), 5000);
+            logger.warn(`Rate limit hit at batch ${batchIndex + 1}, backing off ${backoffMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            // Retry once
+            accountDataResults = await client.multicall({
+              contracts: accountDataCalls,
+            });
+          } else {
+            throw error;
+          }
+        }
+        
         for (let i = 0; i < batchAddresses.length; i++) {
           const accountDataResult = accountDataResults[i];
           if (accountDataResult.status === 'success' && accountDataResult.result) {
@@ -262,20 +296,54 @@ export class SubgraphService {
           }
         }
       }
+      
+      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.05 (filtered ${filteredByHF} healthy users)`);
+      
       const atRiskBatches = Math.ceil(atRiskUsers.length / BATCH_SIZE);
+      logger.info(`Processing ${atRiskUsers.length} at-risk users in ${atRiskBatches} batches for asset validation...`);
+      
       for (let batchIndex = 0; batchIndex < atRiskBatches; batchIndex++) {
         const start = batchIndex * BATCH_SIZE;
         const end = Math.min(start + BATCH_SIZE, atRiskUsers.length);
         const batchUsers = atRiskUsers.slice(start, end);
+        
+        // Rate limiting: delay between batches
+        if (batchIndex > 0) {
+          await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
+        }
+        
+        // Progress logging every 5 batches
+        if (batchIndex % 5 === 0) {
+          logger.info(`Asset validation batch ${batchIndex + 1}/${atRiskBatches} (${Math.round((batchIndex / atRiskBatches) * 100)}%)`);
+        }
+        
         const userConfigCalls = batchUsers.map(user => ({
           address: poolAddress as Address,
           abi: poolAbi,
           functionName: 'getUserConfiguration',
           args: [user.address as Address],
         }));
-        const userConfigResults = await client.multicall({
-          contracts: userConfigCalls,
-        });
+        
+        let userConfigResults;
+        try {
+          userConfigResults = await client.multicall({
+            contracts: userConfigCalls,
+          });
+        } catch (error: any) {
+          // Handle rate limit errors with exponential backoff
+          if (error.code === 429 || error.message?.includes('compute units')) {
+            const backoffMs = Math.min(BATCH_DELAY_MS * Math.pow(2, batchIndex % 5), 5000);
+            logger.warn(`Rate limit hit at asset validation batch ${batchIndex + 1}, backing off ${backoffMs}ms...`);
+            await new Promise(resolve => setTimeout(resolve, backoffMs));
+            // Retry once
+            userConfigResults = await client.multicall({
+              contracts: userConfigCalls,
+            });
+          } else {
+            throw error;
+          }
+        }
+        
         for (let i = 0; i < batchUsers.length; i++) {
           const user = batchUsers[i];
           const userConfigResult = userConfigResults[i];
