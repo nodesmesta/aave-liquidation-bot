@@ -1,5 +1,5 @@
 import { createPublicClient, http, parseAbi, Address, formatUnits } from 'viem';
-import { basePreconf } from 'viem/chains';
+import { base } from 'viem/chains';
 import { logger } from '../utils/logger';
 import { UserHealth } from './HealthChecker';
 import { PriceOracle } from './PriceOracle';
@@ -67,7 +67,7 @@ export class OptimizedLiquidationService {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
     this.publicClient = createPublicClient({
-      chain: basePreconf,
+      chain: base,
       transport: http(rpcUrl),
     });
     this.priceOracle = new PriceOracle(this.publicClient);
@@ -145,7 +145,13 @@ export class OptimizedLiquidationService {
       const uniqueAssets = [...new Set(allAssets)];
       priceMap = await this.priceOracle.getAssetsPrices(uniqueAssets);
     }
-    const validPairs: Array<{ collateral: UserReserveData; debt: UserReserveData; bonus: number }> = [];
+    const validPairs: Array<{ 
+      collateral: UserReserveData; 
+      debt: UserReserveData; 
+      bonus: number;
+      estimatedValue: number;
+      estimatedProfit: number;
+    }> = [];
     for (const collateral of collaterals) {
       for (const debt of debts) {
         const collateralPrice = priceMap.get(collateral.asset);
@@ -161,13 +167,21 @@ export class OptimizedLiquidationService {
         );
         const collateralValueUSD = collateralAmount * collateralPrice;
         const debtValueUSD = debtAmount * debtPrice;
-        const debtToRepayUSD = debtValueUSD * 0.5;
-        const requiredCollateralUSD = debtToRepayUSD * (1 + collateral.liquidationBonus / 100);
-        if (collateralValueUSD >= requiredCollateralUSD) {
+        
+        // Calculate max debt that can be covered by available collateral
+        const liquidationBonusMultiplier = 1 + (collateral.liquidationBonus / 100);
+        const maxDebtValueUSD = collateralValueUSD / liquidationBonusMultiplier;
+        const maxDebtToCoverUSD = Math.min(debtValueUSD, maxDebtValueUSD);
+        
+        // Only consider pairs where we can liquidate at least $10 of debt
+        if (maxDebtToCoverUSD >= 10) {
+          const estimatedProfitUSD = maxDebtToCoverUSD * (collateral.liquidationBonus / 100);
           validPairs.push({
             collateral,
             debt,
-            bonus: collateral.liquidationBonus
+            bonus: collateral.liquidationBonus,
+            estimatedValue: maxDebtToCoverUSD * liquidationBonusMultiplier,
+            estimatedProfit: estimatedProfitUSD
           });
         }
       }
@@ -176,12 +190,16 @@ export class OptimizedLiquidationService {
       logger.warn('No valid pairs with sufficient collateral found');
       return null;
     }
+    
+    // Select pair with highest estimated value (profit potential)
     const bestPair = validPairs.reduce((best, current) => 
-      current.bonus > best.bonus ? current : best
+      current.estimatedValue > best.estimatedValue ? current : best
     );
+    
     logger.info(
       `Selected: ${bestPair.collateral.symbol}-${bestPair.debt.symbol} ` +
-      `(${validPairs.length} valid pairs, bonus: ${bestPair.bonus}%)`
+      `(${validPairs.length} valid pairs, value: $${bestPair.estimatedValue.toFixed(2)}, ` +
+      `profit: $${bestPair.estimatedProfit.toFixed(2)}, bonus: ${bestPair.bonus}%)`
     );
     return {
       collateral: bestPair.collateral,

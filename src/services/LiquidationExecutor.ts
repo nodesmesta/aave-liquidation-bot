@@ -66,7 +66,6 @@ export class LiquidationExecutor {
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
     await this.gasManager.initialize();
-    logger.info('[LiquidationExecutor] Initialized with nonce manager and gas price subscription');
   }
 
   /**
@@ -89,12 +88,7 @@ export class LiquidationExecutor {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
     try {
-      logger.info(`Executing liquidation for ${user} with nonce ${nonce}`, {
-        collateral: collateralAsset,
-        debt: debtAsset,
-        debtToCover: debtToCover.toString(),
-        nonce,
-      });
+      logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
       const fixedGasLimit = 920000n;
       const gasSettings = await this.gasManager.getOptimalGasSettings(
         fixedGasLimit,
@@ -112,12 +106,12 @@ export class LiquidationExecutor {
         gas: gasSettings.gas,
         chain: basePreconf,
       });
-      this.nonceManager.confirmNonce(nonce);
       
-      logger.info(`Transaction sent: ${hash} (nonce: ${nonce})`);
+      this.nonceManager.confirmNonce(nonce);
+      logger.info(`TX sent: ${hash}`);
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status === 'success') {
-        logger.info(`Liquidation successful! TX: ${receipt.transactionHash}`);
+        logger.info(`Liquidation successful: ${receipt.transactionHash}, gas ${receipt.gasUsed}`);
         this.stats.successfulLiquidations++;
         this.stats.totalGasSpent = this.stats.totalGasSpent + receipt.gasUsed;
         this.stats.consecutiveLosses = 0;

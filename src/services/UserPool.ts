@@ -211,13 +211,6 @@ export class UserPool {
    */
   logStatus(): void {
     const stats = this.getStats();
-    logger.info('UserPool Status:');
-    logger.info(`   Total Users: ${stats.totalUsers}`);
-    logger.info(`   Liquidatable (HF < 1.0): ${stats.liquidatable}`);
-    logger.info(`   Critical (HF 1.0-1.05): ${stats.critical}`);
-    logger.info(`   At Risk (HF 1.05-1.1): ${stats.warning}`);
-    logger.info(`   Healthy (HF >= 1.1): ${stats.healthy}`);
-    logger.info(`   Total Collateral: $${stats.totalCollateralUSD.toFixed(2)}`);
-    logger.info(`   Total Debt: $${stats.totalDebtUSD.toFixed(2)}`);
+    logger.info(`Pool: ${stats.totalUsers} users (${stats.liquidatable} liquidatable, ${stats.critical} critical) | TVL $${(stats.totalCollateralUSD / 1000).toFixed(0)}K/$${(stats.totalDebtUSD / 1000).toFixed(0)}K`);
   }
 }

@@ -59,18 +59,14 @@ class LiquidatorBot {
    */
   async initialize(): Promise<void> {
     try {
-      logger.info('Initializing liquidation bot...');
-      logger.info('Strategy: USDC debt users + on-chain validation (HF < 1.05)');
+      logger.info('Initializing bot (strategy: USDC debt, HF < 1.075)...');
       await this.executor.initialize();
-      logger.info('NonceManager initialized for thread-safe parallel execution');
-      logger.info('Gas price WebSocket subscription initialized');
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
-        logger.warn('No liquidation candidates found from Subgraph');
+        logger.warn('No candidates found from subgraph');
         this.isInitialized = true;
         return;
       }
-      logger.info(`Found ${candidatesMap.size} candidates after asset filtering`);
       const userAddresses = Array.from(candidatesMap.keys());
       const validationResults = await this.subgraphService.validateUsersOnChain(
         userAddresses,
@@ -79,20 +75,20 @@ class LiquidatorBot {
         config.aave.protocolDataProvider
       );
       if (validationResults.size === 0) {
-        logger.warn('No critical risk users (HF < 1.05) found on-chain');
+        logger.warn('No at-risk users found on-chain');
         this.isInitialized = true;
         return;
       }
-      logger.info(`Found ${validationResults.size} critical risk users (HF < 1.05)`);
+      logger.info(`Loaded ${validationResults.size} users (${candidatesMap.size} scanned)`);
       for (const [address, data] of validationResults.entries()) {
-        const collateralSymbols = data.collateralAssets.map(addr => getAssetSymbol(addr) || addr);
+        const collateralSymbols = data.collateralAssets.map((addr: string) => getAssetSymbol(addr) || addr);
         this.userPool.addUser({
           address: address,
           estimatedHF: data.hf,
           collateralUSD: data.collateral,
           debtUSD: data.debt,
           collateralAssets: collateralSymbols,
-          debtAssets: data.debtAssets.map(addr => getAssetSymbol(addr) || addr),
+          debtAssets: data.debtAssets.map((addr: string) => getAssetSymbol(addr) || addr),
           lastCheckedHF: data.hf,
           lastUpdated: Date.now(),
           addedAt: Date.now()
@@ -100,7 +96,7 @@ class LiquidatorBot {
       }
       this.userPool.logStatus();
       this.isInitialized = true;
-      logger.info('User pool initialization complete!');
+      logger.info('Initialization complete');
     } catch (error) {
       logger.error('Failed to initialize user pool:', error);
       throw error;
@@ -112,13 +108,13 @@ class LiquidatorBot {
    * @dev Validates config, checks connection, initializes pool, starts monitoring
    */
   async start(): Promise<void> {
-    logger.info('Starting Liquidator Bot...');
+    logger.info('Starting liquidation bot...');
     validateConfig();
-    logger.info(`Bot Wallet: ${this.account.address}`);
+    logger.info(`Wallet: ${this.account.address}`);
     await this.checkConnection();
     await this.initialize();
     await this.ensurePriceMonitoring();
-    logger.info('Liquidator Bot started successfully!');
+    logger.info('Bot started - monitoring for opportunities');
   }
 
   /**
@@ -233,9 +229,7 @@ class LiquidatorBot {
     const chainId = await this.publicClient.getChainId();
     const blockNumber = await this.publicClient.getBlockNumber();
     const balance = await this.publicClient.getBalance({ address: this.account.address });
-    logger.info(`Connected to network: Base (Chain ID: ${chainId})`);
-    logger.info(`Current block: ${blockNumber}`);
-    logger.info(`Wallet balance: ${formatEther(balance)} ETH`);
+    logger.info(`Connected: Base chain ${chainId}, block ${blockNumber}, balance ${formatEther(balance)} ETH`);
     if (Number(chainId) !== basePreconf.id) {
       throw new Error(`Wrong network! Expected ${basePreconf.id}, got ${chainId}`);
     }
@@ -258,12 +252,11 @@ class LiquidatorBot {
     const monitoredSymbols = assetsToMonitor
       .map(addr => getAssetSymbol(addr))
       .filter(symbol => SupportedAsset[symbol]?.monitorPrice);
-    logger.info('Starting Chainlink event-based multi-asset price monitoring (collateral + debt)');
+    logger.info(`Monitoring ${assetsToMonitor.length} assets: ${monitoredSymbols.join(', ')}`);
     this.priceOracle.setFatalErrorHandler(() => {
       logger.error('Fatal WebSocket error detected, initiating bot restart...');
       this.restartBot();
     });
-    logger.info(`Monitoring: ${assetsToMonitor.length} volatile assets (${monitoredSymbols.join(', ')})`);
     const selectedWss = LiquidatorBot.usingPrimaryWss 
       ? config.network.wssUrl 
       : config.network.wssUrlFallback || config.network.wssUrl;

@@ -1,6 +1,6 @@
 import { GraphQLClient, gql } from 'graphql-request';
 import { createPublicClient, http, parseAbi, Address } from 'viem';
-import { basePreconf } from 'viem/chains';
+import { base } from 'viem/chains';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 
@@ -172,7 +172,7 @@ export class SubgraphService {
   ): Promise<Map<string, { hf: number; collateral: number; debt: number; collateralAssets: string[]; debtAssets: string[] }>> {
     logger.info(`Validating ${userAddresses.length} users on-chain via viem multicall...`);
     const client = createPublicClient({
-      chain: basePreconf,
+      chain: base,
       transport: http(rpcUrl),
     });
     const poolAbi = parseAbi([
