@@ -230,7 +230,7 @@ export class SubgraphService {
       const atRiskUsers: Array<{ address: string; hf: number; collateral: number; debt: number }> = [];
       const totalBatches = Math.ceil(userAddresses.length / BATCH_SIZE);
       
-      logger.info(`Processing ${userAddresses.length} users in ${totalBatches} batches (size: ${BATCH_SIZE}, delay: ${BATCH_DELAY_MS}ms)`);
+      logger.info(`Validating ${userAddresses.length} users on-chain via multicall (${totalBatches} batches)...`);
       
       for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
         const start = batchIndex * BATCH_SIZE;
@@ -240,11 +240,6 @@ export class SubgraphService {
         // Rate limiting: delay between batches
         if (batchIndex > 0) {
           await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
-        }
-        
-        // Progress logging every 10 batches
-        if (batchIndex % 10 === 0) {
-          logger.info(`Processing batch ${batchIndex + 1}/${totalBatches} (${Math.round((batchIndex / totalBatches) * 100)}%)`);
         }
         
         const accountDataCalls = batchAddresses.map(address => ({
@@ -300,7 +295,7 @@ export class SubgraphService {
       logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.075 (filtered ${filteredByHF} healthy users)`);
       
       const atRiskBatches = Math.ceil(atRiskUsers.length / BATCH_SIZE);
-      logger.info(`Processing ${atRiskUsers.length} at-risk users in ${atRiskBatches} batches for asset validation...`);
+      logger.info(`Validating assets for ${atRiskUsers.length} at-risk users (${atRiskBatches} batches)...`);
       
       for (let batchIndex = 0; batchIndex < atRiskBatches; batchIndex++) {
         const start = batchIndex * BATCH_SIZE;
@@ -310,11 +305,6 @@ export class SubgraphService {
         // Rate limiting: delay between batches
         if (batchIndex > 0) {
           await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
-        }
-        
-        // Progress logging every 5 batches
-        if (batchIndex % 5 === 0) {
-          logger.info(`Asset validation batch ${batchIndex + 1}/${atRiskBatches} (${Math.round((batchIndex / atRiskBatches) * 100)}%)`);
         }
         
         const userConfigCalls = batchUsers.map(user => ({
