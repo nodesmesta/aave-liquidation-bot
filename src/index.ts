@@ -1,6 +1,8 @@
 import { createPublicClient, http, formatEther, formatUnits } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config, validateConfig, getAssetSymbol } from './config';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { logger } from './utils/logger';
 import { createAccount } from './utils/wallet';
 import { HealthChecker, UserHealth } from './services/HealthChecker';
@@ -114,6 +116,11 @@ class LiquidatorBot {
     await this.checkConnection();
     await this.initialize();
     await this.ensurePriceMonitoring();
+    setInterval(() => {
+      this.exportUserPoolSnapshot();
+    }, 10 * 60 * 1000);
+    this.exportUserPoolSnapshot();
+    
     logger.info('Bot started - monitoring for opportunities');
   }
 
@@ -392,6 +399,38 @@ class LiquidatorBot {
       `(HF: ${best.userHealth.healthFactor.toFixed(4)}, value: $${best.params.estimatedValue.toFixed(0)}, params: ${paramsLatency}ms)`
     );
     return { user: best.userHealth, params: best.params };
+  }
+
+  /**
+   * @notice Export UserPool snapshot to JSON file for monitoring (async, non-blocking)
+   * @dev Called periodically and can be read by external monitoring tools
+   */
+  private async exportUserPoolSnapshot(): Promise<void> {
+    try {
+      const stats = this.userPool.getStats();
+      const users = this.userPool.getAllUsers();
+      
+      const snapshot = {
+        timestamp: Date.now(),
+        stats,
+        users: users.map(u => ({
+          address: u.address,
+          collateralAssets: u.collateralAssets,
+          debtAssets: u.debtAssets,
+          collateralUSD: u.collateralUSD,
+          debtUSD: u.debtUSD,
+          lastCheckedHF: u.lastCheckedHF,
+          lastUpdated: u.lastUpdated,
+          addedAt: u.addedAt,
+        })),
+      };
+      
+      const snapshotPath = path.join(__dirname, '../userpool_snapshot.json');
+      await fs.writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
+      logger.debug(`Snapshoot createdt: ${users.length} users`);
+    } catch (error) {
+      logger.error('Failed to export UserPool snapshot:', error);
+    }
   }
 
   private async executeLiquidationWithParams(
