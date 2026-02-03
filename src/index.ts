@@ -35,7 +35,6 @@ class LiquidatorBot {
 
   constructor() {
     this.rpcUrl = config.network.rpcUrl;
-    // Override basePreconf to use custom RPC URL from ENV
     const customChain: Chain = {
       ...basePreconf,
       rpcUrls: {
