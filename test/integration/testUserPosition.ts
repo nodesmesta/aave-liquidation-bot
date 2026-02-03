@@ -1,5 +1,6 @@
-import { createPublicClient, http, parseAbi, Address } from 'viem';
+import { createPublicClient, createWalletClient, http, parseAbi, Address, formatUnits } from 'viem';
 import { base } from 'viem/chains';
+import { privateKeyToAccount } from 'viem/accounts';
 import { OptimizedLiquidationService } from '../../src/services/OptimizedLiquidationService';
 import { HealthChecker, UserHealth } from '../../src/services/HealthChecker';
 
@@ -8,6 +9,11 @@ const SIMULATED_HF = parseFloat(process.env.SIMULATED_HF || '0.95');
 const RPC_URL = process.env.BASE_RPC_URL || 'https://mainnet.base.org';
 const PROTOCOL_DATA_PROVIDER = '0x2d8A3C5677189723C4cB8873CfC9C8976FDF38Ac';
 const POOL_ADDRESS = '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5';
+const ORACLE_ADDRESS = '0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156';
+const EXECUTE_LIQUIDATION = process.env.EXECUTE_LIQUIDATION === 'true';
+
+// Liquidator contract address from deployment
+const LIQUIDATOR_ADDRESS = (process.env.LIQUIDATOR_CONTRACT_ADDRESS || '0x1eF26FE672e5Bd6af8D9f4B7519B7559626454F7') as Address;
 
 function log(section: string, message: string = '') {
   if (section && !message) {
@@ -195,6 +201,23 @@ async function testBotFlow() {
     console.log(`     ${params.debtToCover}n,`);
     console.log(`     ${params.estimatedValue}`);
     console.log(`   )`);
+
+    // Step 6: Execute liquidation on smart contract (if enabled)
+    if (EXECUTE_LIQUIDATION) {
+      log('Step 6: Execute Smart Contract Liquidation');
+      
+      console.log(`   ⚠️  NOTE: Cannot execute on live network - user is healthy (HF: ${currentHF.toFixed(4)})`);
+      console.log(`   ⚠️  Real liquidation only possible when HF < 1.0`);
+      console.log(`   ℹ️  For full execution test with mock oracle, run Foundry test:`);
+      console.log(`   ℹ️  forge test --match-test testSmartContractLiquidationFlow -vv`);
+      console.log(`\n   Contract deployed at: ${LIQUIDATOR_ADDRESS}`);
+      
+    } else {
+      console.log('\n   ℹ️  Smart contract execution disabled');
+      console.log('   Contract deployed at: ' + LIQUIDATOR_ADDRESS);
+      console.log('   For Foundry test with mock oracle execution:');
+      console.log('   forge test --match-test testSmartContractLiquidationFlow -vv');
+    }
 
   } catch (error: any) {
     console.error('\n❌ Test failed:', error.message);

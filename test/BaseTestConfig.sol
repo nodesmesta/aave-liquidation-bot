@@ -69,6 +69,17 @@ contract BaseTestConfig {
         });
     }
     
+    function getLiquidationCase2() internal pure returns (RealLiquidationCase memory) {
+        return RealLiquidationCase({
+            blockNumber: 0, // Use latest block
+            user: 0x1f9114762Ad947dDa85dc39733bA966D4B6D9d87,
+            collateralAsset: USDC,
+            debtAsset: USDBC,
+            debtAmount: 155138180, // Full debt amount
+            txHash: bytes32(0) // Not executed yet
+        });
+    }
+    
     function calculateCloseFactor(uint256 healthFactor) internal pure returns (uint256) {
         return healthFactor > CLOSE_FACTOR_HF_THRESHOLD ? 5000 : 10000;
     }

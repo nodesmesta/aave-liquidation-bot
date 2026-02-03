@@ -257,7 +257,7 @@ export class OptimizedLiquidationService {
     }
     const debtValue = parseFloat(formatUnits(debtToCover, debt.decimals));
     const debtToCoverUSD = debtValue * debtPrice;
-    const estimatedValue = debtValue * liquidationBonusMultiplier;
+    const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
 
     logger.info(
       `Liquidation calc: totalDebt=${formatUnits(totalDebt, debt.decimals)}, ` +
@@ -274,7 +274,7 @@ export class OptimizedLiquidationService {
       debtToCover,
       debtToCoverUSD,
       liquidationBonus: collateral.liquidationBonus,
-      estimatedValue,
+      estimatedValue: estimatedValueUSD,
     };
   }
   /**
