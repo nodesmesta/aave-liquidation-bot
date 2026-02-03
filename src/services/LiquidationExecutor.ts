@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address } from 'viem';
+import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -27,6 +27,7 @@ export class LiquidationExecutor {
   private gasManager: GasManager;
   private nonceManager: NonceManager;
   private wssUrl: string;
+  private chain: Chain; // Store custom chain for reuse
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
     'function transferOwnership(address newOwner) external',
@@ -44,13 +45,25 @@ export class LiquidationExecutor {
   constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>, wssUrl?: string) {
     this.account = account || createAccount();
     this.wssUrl = wssUrl || rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
+    
+    // Override basePreconf to use custom RPC URL from ENV
+    this.chain = {
+      ...basePreconf,
+      rpcUrls: {
+        ...basePreconf.rpcUrls,
+        default: {
+          http: [rpcUrl],
+        },
+      },
+    } as Chain;
+    
     this.walletClient = viemCreateWalletClient({
       account: this.account,
-      chain: basePreconf,
+      chain: this.chain,
       transport: http(rpcUrl),
     });
     this.publicClient = createPublicClient({
-      chain: basePreconf,
+      chain: this.chain,
       transport: http(rpcUrl),
     });
     this.gasManager = new GasManager(this.publicClient, this.wssUrl);
@@ -104,7 +117,7 @@ export class LiquidationExecutor {
         maxFeePerGas: gasSettings.maxFeePerGas,
         maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
         gas: gasSettings.gas,
-        chain: basePreconf,
+        chain: this.chain,
       });
       
       this.nonceManager.confirmNonce(nonce);
@@ -168,7 +181,7 @@ export class LiquidationExecutor {
       functionName: 'transferOwnership',
       args: [newOwner as Address],
       account: this.account,
-      chain: basePreconf,
+      chain: this.chain,
     });
     const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);

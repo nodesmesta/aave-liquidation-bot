@@ -1,4 +1,4 @@
-import { createPublicClient, webSocket, parseAbiItem, formatUnits, http } from 'viem';
+import { createPublicClient, webSocket, parseAbiItem, formatUnits, http, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -100,8 +100,16 @@ export class PriceOracle {
    */
   private initializeWebSocketClient(wssUrl: string): void {
     if (this.wsClient) return;
+    // Override basePreconf to use custom RPC URL
+    const customChain: Chain = {
+      ...basePreconf,
+      rpcUrls: {
+        ...basePreconf.rpcUrls,
+        default: { http: [wssUrl.replace('wss://', 'https://').replace('ws://', 'http://')] },
+      },
+    } as Chain;
     this.wsClient = createPublicClient({
-      chain: basePreconf,
+      chain: customChain,
       transport: webSocket(wssUrl, {
         keepAlive: true,
         reconnect: true,

@@ -1,4 +1,4 @@
-import { createPublicClient, http, formatEther, formatUnits } from 'viem';
+import { createPublicClient, http, formatEther, formatUnits, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config, validateConfig, getAssetSymbol } from './config';
 import * as fs from 'fs/promises';
@@ -35,8 +35,16 @@ class LiquidatorBot {
 
   constructor() {
     this.rpcUrl = config.network.rpcUrl;
+    // Override basePreconf to use custom RPC URL from ENV
+    const customChain: Chain = {
+      ...basePreconf,
+      rpcUrls: {
+        ...basePreconf.rpcUrls,
+        default: { http: [config.network.rpcUrl] },
+      },
+    } as Chain;
     this.publicClient = createPublicClient({
-      chain: basePreconf,
+      chain: customChain,
       transport: http(config.network.rpcUrl),
     });
     this.account = createAccount();

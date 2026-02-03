@@ -1,4 +1,4 @@
-import { createPublicClient, webSocket } from 'viem';
+import { createPublicClient, webSocket, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { logger } from '../utils/logger';
 
@@ -27,8 +27,16 @@ export class GasManager {
    */
   async initialize(): Promise<void> {
     try {
+      // Override basePreconf to use custom RPC URL
+      const customChain: Chain = {
+        ...basePreconf,
+        rpcUrls: {
+          ...basePreconf.rpcUrls,
+          default: { http: [this.wssUrl.replace('wss://', 'https://').replace('ws://', 'http://')] },
+        },
+      } as Chain;
       this.wsClient = createPublicClient({
-        chain: basePreconf,
+        chain: customChain,
         transport: webSocket(this.wssUrl, {
           keepAlive: true,
           reconnect: true,

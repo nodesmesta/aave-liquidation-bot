@@ -1,4 +1,4 @@
-import { createWalletClient as viemCreateWalletClient, http } from 'viem';
+import { createWalletClient as viemCreateWalletClient, http, Chain } from 'viem';
 import { privateKeyToAccount, mnemonicToAccount, PrivateKeyAccount } from 'viem/accounts';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
@@ -26,9 +26,17 @@ export function createAccount() {
  */
 export function createWalletClient(rpcUrl: string) {
   const account = createAccount();
+  // Override basePreconf to use custom RPC URL from ENV
+  const customChain: Chain = {
+    ...basePreconf,
+    rpcUrls: {
+      ...basePreconf.rpcUrls,
+      default: { http: [rpcUrl] },
+    },
+  } as Chain;
   return viemCreateWalletClient({
     account,
-    chain: basePreconf,
+    chain: customChain,
     transport: http(rpcUrl),
   });
 }

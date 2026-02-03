@@ -66,7 +66,7 @@ async function testBotFlow() {
     const healthCheckLatency = Date.now() - healthCheckStart;
 
     if (multicallResults[0].status !== 'success') {
-      console.log('\n❌ User has no active position or health check failed');
+      console.log('\User has no active position or health check failed');
       process.exit(1);
     }
 
@@ -135,7 +135,7 @@ async function testBotFlow() {
     console.log(`   Available for liquidation: ${availableUsers.length}`);
 
     if (availableUsers.length === 0) {
-      console.log('\n❌ No users available for liquidation');
+      console.log('\No users available for liquidation');
       process.exit(1);
     }
 
@@ -150,7 +150,7 @@ async function testBotFlow() {
     const paramsLatency = Date.now() - paramsStart;
 
     if (paramsMap.size === 0) {
-      console.log('\n❌ No valid liquidations found');
+      console.log('\No valid liquidations found');
       console.log('   Possible reasons:');
       console.log('   - Collateral too small (< $10 liquidation value)');
       console.log('   - Estimated value < $100 minimum');
