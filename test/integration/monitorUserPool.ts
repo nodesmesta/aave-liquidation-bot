@@ -63,10 +63,10 @@ async function monitorUserPool() {
     console.log('USER POOL SUMMARY');
     console.log('='.repeat(70));
     console.log(`Total Users:           ${stats.totalUsers}`);
-    console.log(`├─ Liquidatable (HF < 1.0):    ${stats.liquidatable}`);
-    console.log(`├─ Critical (HF 1.0-1.05):     ${stats.critical}`);
-    console.log(`├─ Warning (HF 1.05-1.1):      ${stats.warning}`);
-    console.log(`└─ Healthy (HF >= 1.1):        ${stats.healthy}`);
+    console.log(`  - Liquidatable (HF < 1.0):    ${stats.liquidatable}`);
+    console.log(`  - Critical (HF 1.0-1.05):     ${stats.critical}`);
+    console.log(`  - Warning (HF 1.05-1.1):      ${stats.warning}`);
+    console.log(`  - Healthy (HF >= 1.1):        ${stats.healthy}`);
     console.log('');
     console.log(`Total Collateral:      $${stats.totalCollateralUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
     console.log(`Total Debt:            $${stats.totalDebtUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
@@ -78,34 +78,31 @@ async function monitorUserPool() {
     console.log('='.repeat(70));
     console.log('');
 
-    // Top 20 risky users
+    // All users sorted by health factor
     const riskyUsers = users
-      .filter(u => u.lastCheckedHF < 1.1)
-      .sort((a, b) => a.lastCheckedHF - b.lastCheckedHF)
-      .slice(0, 20);
+      .sort((a, b) => a.lastCheckedHF - b.lastCheckedHF);
 
     if (riskyUsers.length === 0) {
-      console.log('✅ No risky users (all HF >= 1.1)');
+      console.log('No users in pool');
       console.log('');
       return;
     }
 
-    console.log(`TOP ${Math.min(20, riskyUsers.length)} RISKY USERS (by Health Factor)`);
-    console.log('-'.repeat(70));
-    console.log('Rank | Address           | HF      | Collateral    | Debt         ');
-    console.log('-'.repeat(70));
+    console.log(`ALL USERS (${riskyUsers.length} total, sorted by Health Factor)`);
+    console.log('-'.repeat(110));
+    console.log('Rank | Address                                      | HF      | Collateral    | Debt          | Status');
+    console.log('-'.repeat(110));
 
     riskyUsers.forEach((user, idx) => {
-      const addr = `${user.address.slice(0, 6)}...${user.address.slice(-4)}`;
-      const hfColor = user.lastCheckedHF < 1.0 ? '🔴' : user.lastCheckedHF < 1.03 ? '🟠' : '🟡';
+      const status = user.lastCheckedHF < 1.0 ? 'LIQUIDATABLE' : user.lastCheckedHF < 1.03 ? 'CRITICAL' : user.lastCheckedHF < 1.075 ? 'WARNING' : 'HEALTHY';
       const rank = (idx + 1).toString().padStart(4);
       const hfStr = user.lastCheckedHF.toFixed(4).padStart(7);
       const collStr = `$${user.collateralUSD.toFixed(0)}`.padStart(13);
-      const debtStr = `$${user.debtUSD.toFixed(0)}`.padStart(12);
+      const debtStr = `$${user.debtUSD.toFixed(0)}`.padStart(13);
       
-      console.log(`${rank} | ${addr}  | ${hfStr} | ${collStr} | ${debtStr} ${hfColor}`);
+      console.log(`${rank} | ${user.address} | ${hfStr} | ${collStr} | ${debtStr} | ${status}`);
     });
-    console.log('-'.repeat(70));
+    console.log('-'.repeat(110));
     console.log('');
 
     const collateralAssetCount = new Map<string, number>();
@@ -142,7 +139,7 @@ async function monitorUserPool() {
     console.log('');
 
   } catch (error: any) {
-    console.error('\Error:', error.message);
+    console.error('Error:', error.message);
     if (error.stack) {
       console.error(error.stack);
     }
