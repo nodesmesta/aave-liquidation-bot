@@ -394,19 +394,55 @@ class LiquidatorBot {
       logger.warn('No valid liquidations found (all users failed validation or value < $100)');
       return null;
     }
+    
+    // Sort by value first (best to worst)
     const validLiquidations = Array.from(paramsMap.values());
     validLiquidations.sort((a, b) => {
       const valueDiff = b.params.estimatedValue - a.params.estimatedValue;
       if (Math.abs(valueDiff) > 50) return valueDiff;
       return a.userHealth.healthFactor - b.userHealth.healthFactor;
     });
-    const best = validLiquidations[0];
-    logger.info(
-      `Selected best of ${validLiquidations.length} valid liquidations: ` +
-      `${best.params.collateralSymbol}→${best.params.debtSymbol} ` +
-      `(HF: ${best.userHealth.healthFactor.toFixed(4)}, value: $${best.params.estimatedValue.toFixed(0)}, params: ${paramsLatency}ms)`
+    
+    // Get wallet balance once
+    const balance = await this.publicClient.getBalance({ address: this.account.address });
+    const balanceETH = Number(formatEther(balance));
+    
+    // Find first affordable liquidation (best that we can afford)
+    let skippedCount = 0;
+    for (const liq of validLiquidations) {
+      // Calculate gas cost for this liquidation using GasManager
+      const gasSettings = await this.executor['gasManager'].getOptimalGasSettings(
+        920000n,
+        liq.params.estimatedValue
+      );
+      const maxGasCostWei = 920000n * gasSettings.maxFeePerGas;
+      const maxGasCostETH = Number(formatEther(maxGasCostWei));
+      
+      if (balanceETH >= maxGasCostETH) {
+        // Found best affordable liquidation
+        logger.info(
+          `Selected best affordable of ${validLiquidations.length} liquidations` +
+          `${skippedCount > 0 ? ` (skipped ${skippedCount} higher-value due to insufficient balance)` : ''}: ` +
+          `${liq.params.collateralSymbol}→${liq.params.debtSymbol} ` +
+          `(HF: ${liq.userHealth.healthFactor.toFixed(4)}, value: $${liq.params.estimatedValue.toFixed(0)}, ` +
+          `gas: ${maxGasCostETH.toFixed(6)} ETH, params: ${paramsLatency}ms)`
+        );
+        return { user: liq.userHealth, params: liq.params };
+      } else {
+        skippedCount++;
+        logger.debug(
+          `Skipping #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} (value: $${liq.params.estimatedValue.toFixed(0)}): ` +
+          `insufficient balance (have: ${balanceETH.toFixed(6)} ETH, need: ${maxGasCostETH.toFixed(6)} ETH)`
+        );
+      }
+    }
+    
+    // No affordable liquidation found
+    logger.warn(
+      `No affordable liquidations (balance: ${balanceETH.toFixed(6)} ETH, ` +
+      `all ${validLiquidations.length} opportunities need more funds)`
     );
-    return { user: best.userHealth, params: best.params };
+    return null;
   }
 
   /**
