@@ -38,11 +38,6 @@ export const config = {
     file: process.env.LOG_FILE || 'logs/liquidator.log',
   },
 
-  // Circuit Breaker
-  circuitBreaker: {
-    maxConsecutiveLosses: parseInt(process.env.MAX_CONSECUTIVE_LOSSES || '3'),
-  },
-
   // Rate Limiting & Batching
   rateLimit: {
     batchSize: parseInt(process.env.MULTICALL_BATCH_SIZE || '50'),

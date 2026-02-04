@@ -144,28 +144,11 @@ export class LiquidationExecutor {
       logger.error('Liquidation execution failed:', error);
       this.stats.failedLiquidations++;
       this.stats.consecutiveLosses++;
-      if (this.shouldPause()) {
-        logger.error('Circuit breaker triggered! Pausing bot...');
-        throw new Error('Circuit breaker triggered');
-      }
       return {
         success: false,
         error: error.message || 'Unknown error',
       };
     }
-  }
-
-  /**
-   * @notice Circuit breaker check
-   * @dev Checks if consecutive losses exceed configured threshold
-   * @return True if bot should pause, false otherwise
-   */
-  private shouldPause(): boolean {
-    if (this.stats.consecutiveLosses >= config.circuitBreaker.maxConsecutiveLosses) {
-      logger.error(`Circuit breaker: ${this.stats.consecutiveLosses} consecutive losses`);
-      return true;
-    }
-    return false;
   }
 
   /**
