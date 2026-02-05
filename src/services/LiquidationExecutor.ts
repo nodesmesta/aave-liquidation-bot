@@ -45,22 +45,15 @@ export class LiquidationExecutor {
   constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>, wssUrl?: string) {
     this.account = account || createAccount();
     this.wssUrl = wssUrl || rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
-    
-    // Use basePreconf for flashblocks support
     this.chain = basePreconf;
-    
-    // walletClient: Use basePreconf default transport for flashblocks TX inclusion
-    // This will use https://mainnet-preconf.base.org for fast TX broadcast
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
-      transport: http(), // No parameter - use basePreconf default RPC
+      transport: http(),
     });
-    
-    // publicClient: Use Alchemy RPC for reliable read operations
     this.publicClient = createPublicClient({
       chain: this.chain,
-      transport: http(rpcUrl), // Alchemy for reads
+      transport: http(rpcUrl),
     });
     this.gasManager = new GasManager(this.publicClient, this.wssUrl);
     this.nonceManager = new NonceManager(this.publicClient, this.account.address);
@@ -70,22 +63,35 @@ export class LiquidationExecutor {
   }
 
   /**
-   * @notice Initialize nonce manager (call once at startup)
+   * @notice Initialize nonce and gas managers at bot startup
+   * @dev Verifies flashblocks endpoint configuration and logs RPC endpoints
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
     await this.gasManager.initialize();
+    const walletRpcUrl = this.walletClient.transport.url || 'unknown';
+    const publicRpcUrl = this.publicClient.transport.url || 'unknown';
+    logger.info(`walletClient (TX broadcast): ${walletRpcUrl}`);
+    logger.info(`publicClient (read operations): ${publicRpcUrl}`);
+    if (walletRpcUrl.includes('mainnet-preconf.base.org')) {
+      logger.info('Flashblocks enabled for TX broadcast');
+    } else {
+      logger.warn(`WARNING: Not using flashblocks! TX broadcast endpoint: ${walletRpcUrl}`);
+    }
   }
 
   /**
    * @notice Execute liquidation with simplified parameters
    * @dev Uses EIP-1559 gas with dynamic priority fee based on liquidation value
    * @param collateralAsset Address of collateral asset to seize
+   * @param debtAsset Address of transaction with flashblocks optimization
+   * @dev Implements pre-signing, sequencer verification, and conditional timeout
+   * @param collateralAsset Address of collateral asset to seize
    * @param debtAsset Address of debt asset to repay
    * @param user Address of user to liquidate
    * @param debtToCover Amount of debt to cover
-   * @param estimatedValue Estimated liquidation value in USD (debt + bonus)
-   * @param gasSettings Optional pre-calculated gas settings (avoids recalculation)
+   * @param estimatedValue Estimated liquidation value in USD for gas calculation
+   * @param gasSettings Optional pre-calculated gas settings to avoid recalculation
    * @return Execution result with success status, txHash, and gas used
    */
   async executeLiquidation(
@@ -101,13 +107,7 @@ export class LiquidationExecutor {
     try {
       logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
       const fixedGasLimit = 920000n;
-      // Use provided gas settings if available (avoids recalculation), otherwise calculate
-      const finalGasSettings = gasSettings || await this.gasManager.getOptimalGasSettings(
-        fixedGasLimit,
-        estimatedValue
-      );
-      
-      // Step 1: Prepare transaction (encode function call)
+      const finalGasSettings = gasSettings || await this.gasManager.getOptimalGasSettings(fixedGasLimit, estimatedValue);
       const prepareStart = Date.now();
       const data = encodeFunctionData({
         abi: this.liquidatorAbi,
@@ -115,8 +115,6 @@ export class LiquidationExecutor {
         args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
       });
       const prepareTime = Date.now() - prepareStart;
-      
-      // Step 2: Sign transaction (CPU-intensive)
       const signStart = Date.now();
       const signedTx = await this.account.signTransaction({
         to: config.liquidator.address as Address,
@@ -128,17 +126,38 @@ export class LiquidationExecutor {
         chainId: this.chain.id,
       });
       const signTime = Date.now() - signStart;
-      
-      // Step 3: Broadcast signed transaction (network I/O)
       const broadcastStart = Date.now();
       const hash = await this.walletClient.sendRawTransaction({
         serializedTransaction: signedTx,
       });
       const broadcastTime = Date.now() - broadcastStart;
-      
-      this.nonceManager.confirmNonce(nonce);
-      logger.info(`TX sent: ${hash} (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms)`);
-      const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+      const broadcastEndpoint = this.walletClient.transport.url || 'default';
+      let txAcceptedBySequencer = false;
+      const verifyStart = Date.now();
+      try {
+        const statusResponse: any = await this.walletClient.transport.request({
+          method: 'base_transactionStatus',
+          params: [hash],
+        });
+        const verifyTime = Date.now() - verifyStart;
+        if (statusResponse?.status === 'Known') {
+          txAcceptedBySequencer = true;
+          this.nonceManager.confirmNonce(nonce);
+          logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} Accepted by sequencer (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: ${verifyTime}ms)`);
+        } else {
+          logger.warn(`TX sent: ${hash} -> ${broadcastEndpoint} Unknown to sequencer (status: ${statusResponse?.status || 'null'}, verify: ${verifyTime}ms) - using 5s timeout`);
+        }
+      } catch (verifyError: any) {
+        const verifyTime = Date.now() - verifyStart;
+        txAcceptedBySequencer = true;
+        this.nonceManager.confirmNonce(nonce);
+        logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: N/A - ${verifyError.message})`);
+      }
+      const waitTimeout = txAcceptedBySequencer ? 60_000 : 5_000;
+      const receipt = await this.publicClient.waitForTransactionReceipt({ 
+        hash,
+        timeout: waitTimeout,
+      });
       if (receipt.status === 'success') {
         logger.info(`Liquidation successful: ${receipt.transactionHash}, gas ${receipt.gasUsed}`);
         this.stats.successfulLiquidations++;
@@ -153,13 +172,16 @@ export class LiquidationExecutor {
         throw new Error('Transaction reverted');
       }
     } catch (error: any) {
-      if (!error.message?.includes('transaction hash') && !error.message?.includes('already known')) {
+      const isTimeout = error.message?.includes('timeout') || error.message?.includes('timed out');
+      const isTxKnown = error.message?.includes('transaction hash') || error.message?.includes('already known');
+      if (!isTxKnown) {
         release();
-        logger.warn(`Released nonce ${nonce} due to failed TX`);
-      }
-      logger.error('Liquidation execution failed:', error);
-      this.stats.failedLiquidations++;
-      this.stats.consecutiveLosses++;
+        if (isTimeout) {
+          logger.error(`TX timeout after wait - likely rejected or dropped: ${error.message}`);
+        } else {
+          logger.warn(`Released nonce ${nonce} due to failed TX: ${error.message}`);
+        }
+      }this.stats.consecutiveLosses++;
       return {
         success: false,
         error: error.message || 'Unknown error',
