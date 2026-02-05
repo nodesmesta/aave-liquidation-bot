@@ -30,7 +30,6 @@ class LiquidatorBot {
   private isRestarting = false;
   private pendingUserChecks: Set<string> = new Set();
   private inFlightLiquidations: Set<string> = new Set();
-  private static usingPrimaryWss = true;
   private priceUpdateTimestamp: number = 0;
 
   constructor() {
@@ -149,47 +148,34 @@ class LiquidatorBot {
   }
 
   /**
-   * @notice Restart user pool after successful liquidation
-   * @dev Clears pool, stops monitoring, re-initializes from scratch with race condition protection
+   * @notice Restart bot after successful liquidation via systemd
+   * @dev Gracefully stops bot and exits process, systemd will restart
    */
   async restart(): Promise<void> {
     if (this.isRestarting) {
       return;
     }
     this.isRestarting = true;
-    logger.info('Restarting bot for fresh user pool...');
-    this.isInitialized = false;
-    this.isPriceMonitoring = false;
-    await this.waitForOngoingChecks(10000);
+    logger.info('Successful liquidation - restarting via systemd for fresh state...');
     await this.stop();
-    this.userPool.clear();
-    await this.delay(1000);
-    await this.start();
-    logger.info('Bot restart complete - all state fresh!');
-    this.isRestarting = false;
+    logger.info('Bot stopped gracefully, exiting for systemd restart...');
+    process.exit(0);
   }
 
   /**
-   * @notice Restart bot with provider failover
-   * @dev Toggles between Alchemy and Infura WSS providers
+   * @notice Restart bot via systemd on fatal error
+   * @dev Gracefully stops and exits, systemd will restart
    */
   private async restartBot(): Promise<void> {
     if (this.isRestarting) {
-      logger.warn('Restart already in progress, failover skipped');
+      logger.warn('Restart already in progress, skipped');
       return;
     }
     this.isRestarting = true;
-    LiquidatorBot.usingPrimaryWss = !LiquidatorBot.usingPrimaryWss;
-    const nextProvider = LiquidatorBot.usingPrimaryWss ? 'Alchemy' : 'Infura';
-    logger.warn(`Switching to ${nextProvider}...`);
-    this.isInitialized = false;
-    this.isPriceMonitoring = false;
-    await this.waitForOngoingChecks(10000);
+    logger.error('Fatal error detected - restarting via systemd...');
     await this.stop();
-    await this.delay(1000);
-    await this.start();
-    logger.info('Failover restart complete');
-    this.isRestarting = false;
+    logger.info('Bot stopped gracefully, exiting for systemd restart...');
+    process.exit(1);
   }
 
   /**
@@ -271,13 +257,10 @@ class LiquidatorBot {
       logger.error('Fatal WebSocket error detected, initiating bot restart...');
       this.restartBot();
     });
-    const selectedWss = LiquidatorBot.usingPrimaryWss 
-      ? config.network.wssUrl 
-      : config.network.wssUrlFallback || config.network.wssUrl;
     await this.priceOracle.startPriceMonitoring(
       assetsToMonitor,
       this.handlePriceChange.bind(this),
-      selectedWss
+      config.network.wssUrl
     );
     this.isPriceMonitoring = true;
   }
