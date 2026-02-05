@@ -63,8 +63,6 @@ export class OptimizedLiquidationService {
 
   private reservesCache: Array<{ symbol: string; address: string }> | null = null;
   private reserveConfigCache: Map<string, { decimals: number; liquidationBonus: number }> = new Map();
-  private configCacheTimestamp: number = 0;
-  private readonly CONFIG_CACHE_TTL = 3600000;
 
   constructor(rpcUrl: string, protocolDataProvider: string) {
     this.protocolDataProvider = protocolDataProvider;
@@ -116,51 +114,35 @@ export class OptimizedLiquidationService {
   }
 
   /**
-   * @notice Get reserve configuration with caching
-   * @dev Cache TTL: 1 hour, fetches missing configs on-demand via multicall
-   * @param assetAddresses Array of asset addresses to fetch config for
-   * @return Map of asset address to config (decimals, liquidation bonus)
+   * @notice Warmup reserve config cache by pre-fetching all reserves
+   * @dev Called during bot initialization, cache refreshed on bot restart
    */
-  private async getReserveConfigs(
-    assetAddresses: string[]
-  ): Promise<Map<string, { decimals: number; liquidationBonus: number }>> {
-    const now = Date.now();
-    const isCacheExpired = now - this.configCacheTimestamp > this.CONFIG_CACHE_TTL;
+  async warmupConfigCache(): Promise<void> {
+    const allReserves = await this.getAllReserves();
+    const allAssetAddresses = allReserves.map(r => r.address);
     
-    if (isCacheExpired) {
-      this.reserveConfigCache.clear();
-      this.configCacheTimestamp = now;
-      logger.debug('Reserve config cache expired, cleared');
-    }
+    const configContracts = allAssetAddresses.map(asset => ({
+      address: this.protocolDataProvider as Address,
+      abi: this.dataProviderAbi,
+      functionName: 'getReserveConfigurationData',
+      args: [asset as Address],
+    }));
     
-    const missingAssets = assetAddresses.filter(addr => !this.reserveConfigCache.has(addr));
+    const results = await this.publicClient.multicall({ contracts: configContracts });
     
-    if (missingAssets.length > 0) {
-      const configContracts = missingAssets.map(asset => ({
-        address: this.protocolDataProvider as Address,
-        abi: this.dataProviderAbi,
-        functionName: 'getReserveConfigurationData',
-        args: [asset as Address],
-      }));
-      
-      const results = await this.publicClient.multicall({ contracts: configContracts });
-      
-      for (let i = 0; i < missingAssets.length; i++) {
-        const result = results[i];
-        if (result.status === 'success') {
-          const configData = result.result as any[];
-          const decimals = Number(configData[0]);
-          const liquidationBonusRaw = Number(configData[3]);
-          const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
-          
-          this.reserveConfigCache.set(missingAssets[i], { decimals, liquidationBonus });
-        }
+    for (let i = 0; i < allAssetAddresses.length; i++) {
+      const result = results[i];
+      if (result.status === 'success') {
+        const configData = result.result as any[];
+        const decimals = Number(configData[0]);
+        const liquidationBonusRaw = Number(configData[3]);
+        const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
+        
+        this.reserveConfigCache.set(allAssetAddresses[i], { decimals, liquidationBonus });
       }
-      
-      logger.debug(`Fetched config for ${missingAssets.length} assets, cache size: ${this.reserveConfigCache.size}`);
     }
     
-    return this.reserveConfigCache;
+    logger.info(`Reserve config cache warmed up: ${this.reserveConfigCache.size} assets cached`);
   }
 
   async selectBestPair(
@@ -375,7 +357,6 @@ export class OptimizedLiquidationService {
       functionName: 'getAssetsPrices',
       args: [[...allActiveAssets] as `0x${string}`[]],
     };
-    const configCache = await this.getReserveConfigs([...allActiveAssets]);
     const combinedResults = await this.publicClient.multicall({ 
       contracts: [...reserveDataContracts, priceContract]
     });
@@ -410,7 +391,7 @@ export class OptimizedLiquidationService {
         const usageAsCollateralEnabled = userData[8] as boolean;
         if (collateralBalance === 0n && debtBalance === 0n) continue;
         const reserve = allReserves[reserveId];
-        const config = configCache.get(reserve.address);
+        const config = this.reserveConfigCache.get(reserve.address);
         if (!config) {
           logger.warn(`Config not found for ${reserve.symbol}, skipping`);
           continue;

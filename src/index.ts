@@ -69,6 +69,7 @@ class LiquidatorBot {
     try {
       logger.info('Initializing bot (strategy: USDC debt, HF < 1.075)...');
       await this.executor.initialize();
+      await this.optimizedLiquidation.warmupConfigCache();
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No candidates found from subgraph');
