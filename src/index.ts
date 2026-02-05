@@ -309,7 +309,8 @@ class LiquidatorBot {
     try {
       const usersToCheck = Array.from(this.pendingUserChecks);
       this.pendingUserChecks.clear();
-      logger.info(`Checking ${usersToCheck.length} affected users immediately...`);
+      const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
+      logger.info(`Checking ${usersToCheck.length} affected users (elapsed: ${elapsedSincePriceUpdate}ms)`);
       if (!this.isInitialized) return;
       await this.checkTrackedUsers(usersToCheck);
     } catch (error) {
@@ -348,7 +349,8 @@ class LiquidatorBot {
     }
       const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
       if (liquidatable.length === 0) return;
-      logger.info(`Found ${liquidatable.length} liquidatable users (health check: ${healthCheckLatency}ms)`);
+      const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
+      logger.info(`Found ${liquidatable.length} liquidatable users (health check: ${healthCheckLatency}ms, elapsed: ${elapsedSincePriceUpdate}ms)`);
       const availableUsers = liquidatable.filter(userHealth => {
         if (this.inFlightLiquidations.has(userHealth.user)) {
           logger.debug(`Skipping ${userHealth.user} - already being liquidated`);
@@ -386,11 +388,15 @@ class LiquidatorBot {
     });
     
     // Get wallet balance once
+    const balanceStart = Date.now();
     const balance = await this.publicClient.getBalance({ address: this.account.address });
+    const balanceLatency = Date.now() - balanceStart;
     const balanceETH = Number(formatEther(balance));
     
     // Get base gas price once (inline calculation to avoid method overhead)
+    const gasPriceStart = Date.now();
     const gasPrice = await this.executor['gasManager']['getGasPrice']();
+    const gasPriceLatency = Date.now() - gasPriceStart;
     const baseFee = gasPrice;
     const fixedGasLimit = 920000n;
     
@@ -415,12 +421,15 @@ class LiquidatorBot {
       
       if (balanceETH >= maxGasCostETH) {
         // Found best affordable liquidation
+        const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
         logger.info(
           `Selected best affordable of ${validLiquidations.length} liquidations` +
           `${skippedCount > 0 ? ` (skipped ${skippedCount} higher-value due to insufficient balance)` : ''}: ` +
           `${liq.params.collateralSymbol}→${liq.params.debtSymbol} ` +
           `(HF: ${liq.userHealth.healthFactor.toFixed(4)}, value: $${liq.params.estimatedValue.toFixed(0)}, ` +
-          `gas: ${maxGasCostETH.toFixed(6)} ETH, params: ${paramsLatency}ms)`
+          `gas: ${maxGasCostETH.toFixed(6)} ETH, ` +
+          `timing: params=${paramsLatency}ms balance=${balanceLatency}ms gasPrice=${gasPriceLatency}ms, ` +
+          `elapsed: ${elapsedSincePriceUpdate}ms)`
         );
         return { user: liq.userHealth, params: liq.params, gasSettings };
       } else {
@@ -480,6 +489,9 @@ class LiquidatorBot {
     this.inFlightLiquidations.add(userHealth.user);
     try {
       const executionStart = Date.now();
+      const elapsedBeforeExecution = executionStart - this.priceUpdateTimestamp;
+      logger.info(`Starting execution (elapsed since price update: ${elapsedBeforeExecution}ms)`);
+      
       const tx = await this.executor.executeLiquidation(
         params.collateralAsset,
         params.debtAsset,
