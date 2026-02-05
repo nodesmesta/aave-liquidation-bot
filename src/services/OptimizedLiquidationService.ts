@@ -62,6 +62,9 @@ export class OptimizedLiquidationService {
   ] as const;
 
   private reservesCache: Array<{ symbol: string; address: string }> | null = null;
+  private reserveConfigCache: Map<string, { decimals: number; liquidationBonus: number }> = new Map();
+  private configCacheTimestamp: number = 0;
+  private readonly CONFIG_CACHE_TTL = 3600000;
 
   constructor(rpcUrl: string, protocolDataProvider: string) {
     this.protocolDataProvider = protocolDataProvider;
@@ -77,29 +80,17 @@ export class OptimizedLiquidationService {
    * @notice Decode getUserConfiguration bitmap to extract active reserve IDs
    * @dev Bitmap format: 2 bits per reserve (bit 0 = collateral enabled, bit 1 = borrowed)
    * @param bitmap User configuration bitmap from Aave Pool
-   * @return Object containing collateral IDs, debt IDs, and all active IDs
+   * @return Array of active reserve IDs
    */
-  private decodeBitmap(bitmap: bigint): { collateralIds: number[]; debtIds: number[]; allActiveIds: number[] } {
-    const collateralIds: number[] = [];
-    const debtIds: number[] = [];
+  private decodeBitmap(bitmap: bigint): number[] {
     const allActiveIds: number[] = [];
     for (let i = 0; i < 128; i++) {
-      const collateralBit = (bitmap >> BigInt(i * 2)) & BigInt(1);
-      const borrowedBit = (bitmap >> BigInt(i * 2 + 1)) & BigInt(1);
-      if (collateralBit === BigInt(1)) {
-        collateralIds.push(i);
-        if (!allActiveIds.includes(i)) allActiveIds.push(i);
-      }
-      if (borrowedBit === BigInt(1)) {
-        debtIds.push(i);
-        if (!allActiveIds.includes(i)) allActiveIds.push(i);
+      const hasBits = (bitmap >> BigInt(i * 2)) & BigInt(3);
+      if (hasBits > 0n) {
+        allActiveIds.push(i);
       }
     }
-    logger.debug(
-      `Decoded bitmap: ${allActiveIds.length} active reserves ` +
-      `(${collateralIds.length} collateral, ${debtIds.length} debt)`
-    );
-    return { collateralIds, debtIds, allActiveIds };
+    return allActiveIds;
   }
 
   /**
@@ -123,6 +114,55 @@ export class OptimizedLiquidationService {
     logger.debug(`Cached ${this.reservesCache.length} reserves`);
     return this.reservesCache;
   }
+
+  /**
+   * @notice Get reserve configuration with caching
+   * @dev Cache TTL: 1 hour, fetches missing configs on-demand via multicall
+   * @param assetAddresses Array of asset addresses to fetch config for
+   * @return Map of asset address to config (decimals, liquidation bonus)
+   */
+  private async getReserveConfigs(
+    assetAddresses: string[]
+  ): Promise<Map<string, { decimals: number; liquidationBonus: number }>> {
+    const now = Date.now();
+    const isCacheExpired = now - this.configCacheTimestamp > this.CONFIG_CACHE_TTL;
+    
+    if (isCacheExpired) {
+      this.reserveConfigCache.clear();
+      this.configCacheTimestamp = now;
+      logger.debug('Reserve config cache expired, cleared');
+    }
+    
+    const missingAssets = assetAddresses.filter(addr => !this.reserveConfigCache.has(addr));
+    
+    if (missingAssets.length > 0) {
+      const configContracts = missingAssets.map(asset => ({
+        address: this.protocolDataProvider as Address,
+        abi: this.dataProviderAbi,
+        functionName: 'getReserveConfigurationData',
+        args: [asset as Address],
+      }));
+      
+      const results = await this.publicClient.multicall({ contracts: configContracts });
+      
+      for (let i = 0; i < missingAssets.length; i++) {
+        const result = results[i];
+        if (result.status === 'success') {
+          const configData = result.result as any[];
+          const decimals = Number(configData[0]);
+          const liquidationBonusRaw = Number(configData[3]);
+          const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
+          
+          this.reserveConfigCache.set(missingAssets[i], { decimals, liquidationBonus });
+        }
+      }
+      
+      logger.debug(`Fetched config for ${missingAssets.length} assets, cache size: ${this.reserveConfigCache.size}`);
+    }
+    
+    return this.reserveConfigCache;
+  }
+
   async selectBestPair(
     userReserves: UserReserveData[],
     priceCache?: Map<string, number>
@@ -289,74 +329,67 @@ export class OptimizedLiquidationService {
     if (users.length === 0) return new Map();
     const startTime = Date.now();
     const allReserves = await this.getAllReserves();
-    const allUniqueAssets = new Set<string>();
-    for (const reserve of allReserves) {
-      allUniqueAssets.add(reserve.address);
-    }
     const bitmapContracts = users.map(user => ({
       address: this.poolAddress as Address,
       abi: this.poolAbi,
       functionName: 'getUserConfiguration',
       args: [user.user as Address],
     }));
-    const priceContract = {
-      address: this.priceOracle['AAVE_ORACLE'] as Address,
-      abi: this.priceOracle['ORACLE_ABI'],
-      functionName: 'getAssetsPrices',
-      args: [[...allUniqueAssets] as `0x${string}`[]],
-    };
-    const combinedResults = await this.publicClient.multicall({ 
-      contracts: [...bitmapContracts, priceContract]
-    });
-    const bitmapResults = combinedResults.slice(0, users.length);
-    const pricesResult = combinedResults[users.length];
-    let priceCache = new Map<string, number>();
-    if (pricesResult.status === 'success') {
-      const prices = pricesResult.result as bigint[];
-      const assetArray = [...allUniqueAssets];
-      assetArray.forEach((asset, index) => {
-        const price = parseFloat(formatUnits(prices[index], 8));
-        priceCache.set(asset, price);
-      });
-    }
+    const bitmapResults = await this.publicClient.multicall({ contracts: bitmapContracts });
     const reserveDataContracts: any[] = [];
+    const allActiveAssets = new Set<string>();
     const userReserveMap: Map<string, { ids: number[]; startIndex: number; count: number }> = new Map();
     let currentIndex = 0;
     for (let i = 0; i < users.length; i++) {
       const bitmapResult = bitmapResults[i];
       if (bitmapResult.status !== 'success') continue;
       const bitmap = bitmapResult.result as bigint;
-      const { allActiveIds } = this.decodeBitmap(bitmap);
+      const allActiveIds = this.decodeBitmap(bitmap);
       if (allActiveIds.length === 0) continue;
       const validIds = allActiveIds.filter(id => id < allReserves.length);
       if (validIds.length === 0) continue;
       userReserveMap.set(users[i].user, {
         ids: validIds,
         startIndex: currentIndex,
-        count: validIds.length * 2,
+        count: validIds.length,
       });
       for (const reserveId of validIds) {
         const reserve = allReserves[reserveId];
+        allActiveAssets.add(reserve.address);
         reserveDataContracts.push({
           address: this.protocolDataProvider as Address,
           abi: this.dataProviderAbi,
           functionName: 'getUserReserveData',
           args: [reserve.address as Address, users[i].user as Address],
         });
-        reserveDataContracts.push({
-          address: this.protocolDataProvider as Address,
-          abi: this.dataProviderAbi,
-          functionName: 'getReserveConfigurationData',
-          args: [reserve.address as Address],
-        });
       }
-      currentIndex += validIds.length * 2;
+      currentIndex += validIds.length;
     }
     if (reserveDataContracts.length === 0) {
       logger.debug('No active reserves found for any user');
       return new Map();
     }
-    const reserveDataResults = await this.publicClient.multicall({ contracts: reserveDataContracts });
+    const priceContract = {
+      address: this.priceOracle['AAVE_ORACLE'] as Address,
+      abi: this.priceOracle['ORACLE_ABI'],
+      functionName: 'getAssetsPrices',
+      args: [[...allActiveAssets] as `0x${string}`[]],
+    };
+    const configCache = await this.getReserveConfigs([...allActiveAssets]);
+    const combinedResults = await this.publicClient.multicall({ 
+      contracts: [...reserveDataContracts, priceContract]
+    });
+    const reserveDataResults = combinedResults.slice(0, reserveDataContracts.length);
+    const pricesResult = combinedResults[reserveDataContracts.length];
+    let priceCache = new Map<string, number>();
+    if (pricesResult.status === 'success') {
+      const prices = pricesResult.result as bigint[];
+      const assetArray = [...allActiveAssets];
+      assetArray.forEach((asset, index) => {
+        const price = parseFloat(formatUnits(prices[index], 8));
+        priceCache.set(asset, price);
+      });
+    }
     const allUserReservesMap = new Map<string, UserReserveData[]>();
     for (const userHealth of users) {
       const userMapping = userReserveMap.get(userHealth.user);
@@ -364,15 +397,12 @@ export class OptimizedLiquidationService {
       const userReserves: UserReserveData[] = [];
       for (let i = 0; i < userMapping.ids.length; i++) {
         const reserveId = userMapping.ids[i];
-        const userDataIndex = userMapping.startIndex + i * 2;
-        const configDataIndex = userMapping.startIndex + i * 2 + 1;
+        const userDataIndex = userMapping.startIndex + i;
         const userDataResult = reserveDataResults[userDataIndex];
-        const configDataResult = reserveDataResults[configDataIndex];
-        if (userDataResult.status !== 'success' || configDataResult.status !== 'success') {
+        if (userDataResult.status !== 'success') {
           continue;
         }
         const userData = userDataResult.result as any[];
-        const configData = configDataResult.result as any[];
         const collateralBalance = BigInt(userData[0].toString());
         const stableDebt = BigInt(userData[1].toString());
         const variableDebt = BigInt(userData[2].toString());
@@ -380,17 +410,19 @@ export class OptimizedLiquidationService {
         const usageAsCollateralEnabled = userData[8] as boolean;
         if (collateralBalance === 0n && debtBalance === 0n) continue;
         const reserve = allReserves[reserveId];
-        const decimals = Number(configData[0]);
-        const liquidationBonusRaw = Number(configData[3]);
-        const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
+        const config = configCache.get(reserve.address);
+        if (!config) {
+          logger.warn(`Config not found for ${reserve.symbol}, skipping`);
+          continue;
+        }
         userReserves.push({
           asset: reserve.address,
           symbol: reserve.symbol,
-          decimals,
+          decimals: config.decimals,
           collateralBalance,
           debtBalance,
           usageAsCollateralEnabled,
-          liquidationBonus,
+          liquidationBonus: config.liquidationBonus,
         });
       }
       if (userReserves.length > 0) {
@@ -417,7 +449,7 @@ export class OptimizedLiquidationService {
     const elapsed = Date.now() - startTime;
     logger.info(
       `Parallel fetch complete: ${users.length} users, ${resultMap.size} valid liquidations, ` +
-      `${reserveDataContracts.length / 2} reserves fetched in ${elapsed}ms (multicall)`
+      `${allActiveAssets.size} active assets, ${reserveDataContracts.length} user reserves fetched in ${elapsed}ms`
     );
     return resultMap;
   }

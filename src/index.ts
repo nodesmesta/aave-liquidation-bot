@@ -267,59 +267,89 @@ class LiquidatorBot {
 
   /**
    * @notice Handle Chainlink price update events
-   * @dev Logs price changes, identifies affected users, triggers health checks
+   * @dev Optimized: Check high-risk users (HF <= 1.03) first, then update cache for all affected
    * @param updates Array of price updates from Chainlink
    */
   private async handlePriceChange(updates: PriceUpdate[]): Promise<void> {
     if (updates.length === 0) return;
     if (!this.isInitialized || this.isRestarting) return;
     this.priceUpdateTimestamp = Date.now();
+    const highRiskUsers = new Set<string>();
+    const allAffectedUsers = new Set<string>();
     for (const update of updates) {
       const assetSymbol = getAssetSymbol(update.asset);
       const usersWithCollateral = this.userPool.getUsersWithCollateral(assetSymbol);
       const usersWithDebt = this.userPool.getUsersWithDebt(assetSymbol);
-      const totalAffected = new Set([...usersWithCollateral, ...usersWithDebt]).size;
+      const highRiskCollateral = usersWithCollateral.filter(u => u.lastCheckedHF <= 1.03);
+      const highRiskDebt = usersWithDebt.filter(u => u.lastCheckedHF <= 1.03);
+      highRiskCollateral.forEach(user => highRiskUsers.add(user.address));
+      highRiskDebt.forEach(user => highRiskUsers.add(user.address));
+      usersWithCollateral.forEach(user => allAffectedUsers.add(user.address));
+      usersWithDebt.forEach(user => allAffectedUsers.add(user.address));
+      const totalAffected = allAffectedUsers.size;
+      const highRiskCount = highRiskUsers.size;
       if (totalAffected > 0) {
         logger.info(
           `${assetSymbol} ${update.percentChange > 0 ? '↑' : '↓'}${Math.abs(update.percentChange).toFixed(2)}% ` +
           `($${update.oldPrice.toFixed(2)} → $${update.newPrice.toFixed(2)}) affects ` +
-          `${totalAffected} users (${usersWithCollateral.length} collateral, ${usersWithDebt.length} debt)`
+          `${totalAffected} users (${highRiskCount} high-risk HF<=1.03, ${totalAffected - highRiskCount} others)`
         );
-        usersWithCollateral.forEach(user => this.pendingUserChecks.add(user.address));
-        usersWithDebt.forEach(user => this.pendingUserChecks.add(user.address));
       }
     }
-    if (!this.isCheckingUsers && this.pendingUserChecks.size > 0) {
-      this.checkPendingUsers();
+    if (!this.isCheckingUsers && highRiskUsers.size > 0) {
+      this.checkHighRiskThenUpdateCache(Array.from(highRiskUsers), Array.from(allAffectedUsers));
     }
   }
 
   /**
-   * @notice Process pending user health checks asynchronously
-   * @dev Batch-checks users flagged by price updates, auto-processes new pending users after completion
+   * @notice Check high-risk users first, execute if liquidatable, otherwise update cache for all affected
+   * @dev Two-phase strategy: fast path for liquidation, slow path for cache updates
+   * @param highRiskUsers Users with HF <= 1.03 to check first
+   * @param allAffectedUsers All users affected by price change for cache update
    */
-  private async checkPendingUsers(): Promise<void> {
+  private async checkHighRiskThenUpdateCache(highRiskUsers: string[], allAffectedUsers: string[]): Promise<void> {
     if (this.isCheckingUsers) return;
-    if (this.pendingUserChecks.size === 0) return;
-    if (!this.isInitialized || this.isRestarting) {
-      this.pendingUserChecks.clear();
-      return;
-    }
+    if (!this.isInitialized || this.isRestarting) return;
     this.isCheckingUsers = true;
     try {
-      const usersToCheck = Array.from(this.pendingUserChecks);
-      this.pendingUserChecks.clear();
       const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
-      logger.info(`Checking ${usersToCheck.length} affected users (elapsed: ${elapsedSincePriceUpdate}ms)`);
-      if (!this.isInitialized) return;
-      await this.checkTrackedUsers(usersToCheck);
+      logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (elapsed: ${elapsedSincePriceUpdate}ms)`);
+      const highRiskCheckStart = Date.now();
+      const highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
+      const highRiskCheckLatency = Date.now() - highRiskCheckStart;
+      const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
+      if (liquidatable.length > 0) {
+        const elapsedAfterCheck = Date.now() - this.priceUpdateTimestamp;
+        logger.info(`Found ${liquidatable.length} liquidatable users in high-risk check (check: ${highRiskCheckLatency}ms, elapsed: ${elapsedAfterCheck}ms)`);
+        const availableUsers = liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
+        if (availableUsers.length > 0) {
+          const selection = await this.selectBestLiquidation(availableUsers);
+          if (selection) {
+            const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
+            if (success) await this.restart();
+            return;
+          }
+        }
+      }
+      logger.info(`Phase 2: No liquidatable positions found, updating cache for ${allAffectedUsers.length} affected users`);
+      const cacheUpdateStart = Date.now();
+      const allHealthMap = await this.healthChecker.checkUsers(allAffectedUsers);
+      const cacheUpdateLatency = Date.now() - cacheUpdateStart;
+      let removedCount = 0;
+      for (const [address, health] of allHealthMap.entries()) {
+        if (health.healthFactor >= 1.1) {
+          this.userPool.removeUser(address);
+          removedCount++;
+        } else {
+          this.userPool.updateUserHF(address, health.healthFactor);
+        }
+      }
+      const totalElapsed = Date.now() - this.priceUpdateTimestamp;
+      logger.info(`Cache updated (${removedCount} removed, check: ${cacheUpdateLatency}ms, total elapsed: ${totalElapsed}ms)`);
     } catch (error) {
-      logger.error('Error checking pending users:', error);
+      logger.error('Error in two-phase health check:', error);
     } finally {
       this.isCheckingUsers = false;
-      if (this.pendingUserChecks.size > 0 && this.isInitialized && !this.isRestarting) {
-        setImmediate(() => this.checkPendingUsers());
-      }
     }
   }
 
