@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address, Chain } from 'viem';
+import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address, Chain, encodeFunctionData } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -23,11 +23,11 @@ export interface ExecutionResult {
 export class LiquidationExecutor {
   private account: ReturnType<typeof createAccount>;
   private walletClient: ReturnType<typeof viemCreateWalletClient>;
-  private publicClient: any; // PublicClient type causes conflicts with multiple viem imports
+  private publicClient: any;
   private gasManager: GasManager;
   private nonceManager: NonceManager;
   private wssUrl: string;
-  private chain: Chain; // Store custom chain for reuse
+  private chain: Chain;
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
     'function transferOwnership(address newOwner) external',
@@ -89,6 +89,7 @@ export class LiquidationExecutor {
    * @param user Address of user to liquidate
    * @param debtToCover Amount of debt to cover
    * @param estimatedValue Estimated liquidation value in USD (debt + bonus)
+   * @param gasSettings Optional pre-calculated gas settings (avoids recalculation)
    * @return Execution result with success status, txHash, and gas used
    */
   async executeLiquidation(
@@ -96,32 +97,51 @@ export class LiquidationExecutor {
     debtAsset: string,
     user: string,
     debtToCover: bigint,
-    estimatedValue: number
+    estimatedValue: number,
+    gasSettings?: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
     try {
       logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
       const fixedGasLimit = 920000n;
-      const gasSettings = await this.gasManager.getOptimalGasSettings(
+      // Use provided gas settings if available (avoids recalculation), otherwise calculate
+      const finalGasSettings = gasSettings || await this.gasManager.getOptimalGasSettings(
         fixedGasLimit,
         estimatedValue
       );
-      const hash = await this.walletClient.writeContract({
-        address: config.liquidator.address as Address,
+      
+      // Step 1: Prepare transaction (encode function call)
+      const prepareStart = Date.now();
+      const data = encodeFunctionData({
         abi: this.liquidatorAbi,
         functionName: 'executeLiquidation',
         args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
-        account: this.account,
-        nonce: nonce,
-        maxFeePerGas: gasSettings.maxFeePerGas,
-        maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
-        gas: gasSettings.gas,
-        chain: this.chain,
       });
+      const prepareTime = Date.now() - prepareStart;
+      
+      // Step 2: Sign transaction (CPU-intensive)
+      const signStart = Date.now();
+      const signedTx = await this.account.signTransaction({
+        to: config.liquidator.address as Address,
+        data,
+        nonce,
+        maxFeePerGas: finalGasSettings.maxFeePerGas,
+        maxPriorityFeePerGas: finalGasSettings.maxPriorityFeePerGas,
+        gas: finalGasSettings.gas,
+        chainId: this.chain.id,
+      });
+      const signTime = Date.now() - signStart;
+      
+      // Step 3: Broadcast signed transaction (network I/O)
+      const broadcastStart = Date.now();
+      const hash = await this.walletClient.sendRawTransaction({
+        serializedTransaction: signedTx,
+      });
+      const broadcastTime = Date.now() - broadcastStart;
       
       this.nonceManager.confirmNonce(nonce);
-      logger.info(`TX sent: ${hash}`);
+      logger.info(`TX sent: ${hash} (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms)`);
       const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status === 'success') {
         logger.info(`Liquidation successful: ${receipt.transactionHash}, gas ${receipt.gasUsed}`);

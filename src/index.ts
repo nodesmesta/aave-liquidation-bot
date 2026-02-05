@@ -362,13 +362,13 @@ class LiquidatorBot {
       }
       const selection = await this.selectBestLiquidation(availableUsers);
       if (!selection) return;
-      const success = await this.executeLiquidationWithParams(selection.user, selection.params);
+      const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
       if (success) await this.restart();
   }
 
   private async selectBestLiquidation(
     users: UserHealth[]
-  ): Promise<{ user: UserHealth; params: LiquidationParams } | null> {
+  ): Promise<{ user: UserHealth; params: LiquidationParams; gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint } } | null> {
     const paramsStart = Date.now();
     const paramsMap = await this.optimizedLiquidation.getLiquidationParamsForMultipleUsers(users);
     const paramsLatency = Date.now() - paramsStart;
@@ -389,15 +389,28 @@ class LiquidatorBot {
     const balance = await this.publicClient.getBalance({ address: this.account.address });
     const balanceETH = Number(formatEther(balance));
     
+    // Get base gas price once (inline calculation to avoid method overhead)
+    const gasPrice = await this.executor['gasManager']['getGasPrice']();
+    const baseFee = gasPrice;
+    const fixedGasLimit = 920000n;
+    
     // Find first affordable liquidation (best that we can afford)
     let skippedCount = 0;
     for (const liq of validLiquidations) {
-      // Calculate gas cost for this liquidation using GasManager
-      const gasSettings = await this.executor['gasManager'].getOptimalGasSettings(
-        920000n,
-        liq.params.estimatedValue
-      );
-      const maxGasCostWei = 920000n * gasSettings.maxFeePerGas;
+      // Inline gas calculation (avoid method call overhead)
+      const basePriorityFee = 1_000_000_000n; // 1 gwei
+      const valueAbove100 = Math.max(0, liq.params.estimatedValue - 100);
+      const additionalPriorityGwei = valueAbove100 * 0.01;
+      const additionalPriorityWei = BigInt(Math.floor(additionalPriorityGwei * 1e9));
+      const priorityFee = basePriorityFee + additionalPriorityWei;
+      const maxFeePerGas = (baseFee * 110n) / 100n + priorityFee;
+      const gasSettings = {
+        maxFeePerGas,
+        maxPriorityFeePerGas: priorityFee,
+        gas: fixedGasLimit,
+      };
+      
+      const maxGasCostWei = fixedGasLimit * gasSettings.maxFeePerGas;
       const maxGasCostETH = Number(formatEther(maxGasCostWei));
       
       if (balanceETH >= maxGasCostETH) {
@@ -409,7 +422,7 @@ class LiquidatorBot {
           `(HF: ${liq.userHealth.healthFactor.toFixed(4)}, value: $${liq.params.estimatedValue.toFixed(0)}, ` +
           `gas: ${maxGasCostETH.toFixed(6)} ETH, params: ${paramsLatency}ms)`
         );
-        return { user: liq.userHealth, params: liq.params };
+        return { user: liq.userHealth, params: liq.params, gasSettings };
       } else {
         skippedCount++;
         logger.debug(
@@ -461,7 +474,8 @@ class LiquidatorBot {
 
   private async executeLiquidationWithParams(
     userHealth: UserHealth,
-    params: LiquidationParams
+    params: LiquidationParams,
+    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
   ): Promise<boolean> {
     this.inFlightLiquidations.add(userHealth.user);
     try {
@@ -471,7 +485,8 @@ class LiquidatorBot {
         params.debtAsset,
         params.userAddress,
         params.debtToCover,
-        params.estimatedValue
+        params.estimatedValue,
+        gasSettings
       );
       const executionLatency = Date.now() - executionStart;
       const totalLatency = Date.now() - this.priceUpdateTimestamp;

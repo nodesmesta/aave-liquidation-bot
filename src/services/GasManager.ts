@@ -76,7 +76,7 @@ export class GasManager {
    * @dev Uses cached value if available, otherwise queries RPC
    * @return Current gas price in wei
    */
-  private async getGasPrice(): Promise<bigint> {
+  async getGasPrice(): Promise<bigint> {
     if (this.cachedGasPrice !== null) {
       return this.cachedGasPrice;
     }
