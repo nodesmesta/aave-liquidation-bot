@@ -46,25 +46,21 @@ export class LiquidationExecutor {
     this.account = account || createAccount();
     this.wssUrl = wssUrl || rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
     
-    // Override basePreconf to use custom RPC URL from ENV
-    this.chain = {
-      ...basePreconf,
-      rpcUrls: {
-        ...basePreconf.rpcUrls,
-        default: {
-          http: [rpcUrl],
-        },
-      },
-    } as Chain;
+    // Use basePreconf for flashblocks support
+    this.chain = basePreconf;
     
+    // walletClient: Use basePreconf default transport for flashblocks TX inclusion
+    // This will use https://mainnet-preconf.base.org for fast TX broadcast
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
-      transport: http(rpcUrl),
+      transport: http(), // No parameter - use basePreconf default RPC
     });
+    
+    // publicClient: Use Alchemy RPC for reliable read operations
     this.publicClient = createPublicClient({
       chain: this.chain,
-      transport: http(rpcUrl),
+      transport: http(rpcUrl), // Alchemy for reads
     });
     this.gasManager = new GasManager(this.publicClient, this.wssUrl);
     this.nonceManager = new NonceManager(this.publicClient, this.account.address);
