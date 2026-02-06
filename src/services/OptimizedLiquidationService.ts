@@ -270,14 +270,48 @@ export class OptimizedLiquidationService {
     const maxDebtByCollateralBN = BigInt(
       Math.floor(maxDebtByCollateral * 10 ** debt.decimals)
     );
-    const debtToCover = totalDebt < maxDebtByCollateralBN 
+    let debtToCover = totalDebt < maxDebtByCollateralBN 
       ? totalDebt 
       : maxDebtByCollateralBN;
     if (debtToCover === 0n) {
       logger.warn('Calculated debtToCover is 0, skipping liquidation');
       return null;
     }
-    const debtValue = parseFloat(formatUnits(debtToCover, debt.decimals));
+    const BASE_CURRENCY_DECIMALS = 8;
+    const MIN_LEFTOVER_BASE = 100000000;
+    const SAFETY_MARGIN = 1.1;
+    const totalDebtFloat = parseFloat(formatUnits(totalDebt, debt.decimals));
+    let debtToCoverFloat = parseFloat(formatUnits(debtToCover, debt.decimals));
+    if (debtToCover < totalDebt) {
+      const collateralToSeizeUSD = debtToCoverFloat * debtPrice * liquidationBonusMultiplier;
+      const collateralToSeize = collateralToSeizeUSD / collateralPrice;
+      if (collateralToSeize < collateralAmount) {
+        const debtLeftover = totalDebtFloat - debtToCoverFloat;
+        const collateralLeftover = collateralAmount - collateralToSeize;
+        const debtLeftoverBase = Math.ceil(debtLeftover * debtPrice * (10 ** BASE_CURRENCY_DECIMALS));
+        const collateralLeftoverBase = Math.ceil(collateralLeftover * collateralPrice * (10 ** BASE_CURRENCY_DECIMALS));
+        const isDebtMoreThanThreshold = debtLeftoverBase >= MIN_LEFTOVER_BASE;
+        const isCollateralMoreThanThreshold = collateralLeftoverBase >= MIN_LEFTOVER_BASE;
+        if (!isDebtMoreThanThreshold || !isCollateralMoreThanThreshold) {
+          const targetLeftoverUSD = SAFETY_MARGIN;
+          const maxDebtByDebtLeftover = totalDebtFloat - (targetLeftoverUSD / debtPrice);
+          const maxDebtByCollateralLeftover = ((collateralValueUSD - targetLeftoverUSD) / liquidationBonusMultiplier) / debtPrice;
+          const adjustedDebtToCover = Math.min(maxDebtByDebtLeftover, maxDebtByCollateralLeftover);
+          debtToCover = BigInt(Math.floor(adjustedDebtToCover * 10 ** debt.decimals));
+          debtToCoverFloat = adjustedDebtToCover;
+          logger.info(
+            `Adjusted for MustNotLeaveDust: debtLeftover=$${(debtLeftoverBase / 1e8).toFixed(2)}, ` +
+            `collateralLeftover=$${(collateralLeftoverBase / 1e8).toFixed(2)} ` +
+            `-> adjusted to leave >= $${targetLeftoverUSD}`
+          );
+        }
+      }
+    }
+    if (debtToCover === 0n) {
+      logger.warn('Adjusted debtToCover is 0 after MustNotLeaveDust check, skipping liquidation');
+      return null;
+    }
+    const debtValue = debtToCoverFloat;
     const debtToCoverUSD = debtValue * debtPrice;
     const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
 

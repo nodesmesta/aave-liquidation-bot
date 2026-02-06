@@ -19,24 +19,17 @@ export function createAccount() {
 }
 
 /**
- * @notice Create viem wallet client for transaction signing
- * @dev Uses account from createAccount() with configured RPC
- * @param rpcUrl RPC endpoint URL
- * @return Viem wallet client instance
+ * @notice Create viem wallet client for transaction signing with Flashblocks
+ * @dev ALWAYS uses basePreconf default (flashblocks) - DO NOT pass custom RPC for TX broadcast
+ * @dev For read operations, use createPublicClient with Alchemy instead
+ * @return Viem wallet client instance with flashblocks endpoint
  */
-export function createWalletClient(rpcUrl: string) {
+export function createWalletClient() {
   const account = createAccount();
-  // Override basePreconf to use custom RPC URL from ENV
-  const customChain: Chain = {
-    ...basePreconf,
-    rpcUrls: {
-      ...basePreconf.rpcUrls,
-      default: { http: [rpcUrl] },
-    },
-  } as Chain;
   return viemCreateWalletClient({
     account,
-    chain: customChain,
-    transport: http(rpcUrl),
+    chain: basePreconf,
+    transport: http(),
   });
 }
+

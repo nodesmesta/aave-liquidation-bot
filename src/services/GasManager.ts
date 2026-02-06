@@ -100,8 +100,9 @@ export class GasManager {
 
   /**
    * @notice Get optimal gas settings for transaction with dynamic priority fee
-   * @dev Priority fee scales with liquidation value (includes debt + bonus)
-   *      Formula: 1 gwei + (value-100)*0.01 gwei (1 gwei per $100)
+   * @dev Priority fee scales with liquidation value: 0.2 gwei per $100 USD
+   *      Formula: (liquidationValueUSD / 100) * 0.2 gwei
+   *      Example: $1000 liquidation = (1000/100) * 0.2 = 2 gwei priority fee
    * @param gasLimit Gas limit for the transaction
    * @param liquidationValueUSD Liquidation value in USD (debt + bonus = total profitability)
    * @return Gas settings with maxFeePerGas, maxPriorityFeePerGas, and gas
@@ -112,11 +113,8 @@ export class GasManager {
   ): Promise<GasSettings> {
     const gasPrice = await this.getGasPrice();
     const baseFee = gasPrice;
-    const basePriorityFee = 1_000_000_000n;
-    const valueAbove100 = Math.max(0, liquidationValueUSD - 100);
-    const additionalPriorityGwei = valueAbove100 * 0.01;
-    const additionalPriorityWei = BigInt(Math.floor(additionalPriorityGwei * 1e9));
-    const priorityFee = basePriorityFee + additionalPriorityWei;
+    const priorityFeeGwei = (liquidationValueUSD / 100) * 0.2;
+    const priorityFee = BigInt(Math.floor(priorityFeeGwei * 1e9));
     const maxFeePerGas = (baseFee * 110n) / 100n + priorityFee;
     return {
       maxFeePerGas,

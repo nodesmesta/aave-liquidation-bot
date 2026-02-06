@@ -76,7 +76,7 @@ export class LiquidationExecutor {
     if (walletRpcUrl.includes('mainnet-preconf.base.org')) {
       logger.info('Flashblocks enabled for TX broadcast');
     } else {
-      logger.warn(`WARNING: Not using flashblocks! TX broadcast endpoint: ${walletRpcUrl}`);
+      throw new Error(`CRITICAL: Must use flashblocks endpoint! Current: ${walletRpcUrl}. Set BASE_RPC_URL=https://mainnet-preconf.base.org`);
     }
   }
 
@@ -132,7 +132,6 @@ export class LiquidationExecutor {
       });
       const broadcastTime = Date.now() - broadcastStart;
       const broadcastEndpoint = this.walletClient.transport.url || 'default';
-      let txAcceptedBySequencer = false;
       const verifyStart = Date.now();
       try {
         const statusResponse: any = await this.walletClient.transport.request({
@@ -140,20 +139,23 @@ export class LiquidationExecutor {
           params: [hash],
         });
         const verifyTime = Date.now() - verifyStart;
-        if (statusResponse?.status === 'Known') {
-          txAcceptedBySequencer = true;
-          this.nonceManager.confirmNonce(nonce);
-          logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} Accepted by sequencer (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: ${verifyTime}ms)`);
-        } else {
-          logger.warn(`TX sent: ${hash} -> ${broadcastEndpoint} Unknown to sequencer (status: ${statusResponse?.status || 'null'}, verify: ${verifyTime}ms) - using 5s timeout`);
+        if (statusResponse?.status !== 'Known') {
+          release();
+          const errorMsg = `TX rejected by sequencer: ${hash} (status: ${statusResponse?.status || 'null'})`;
+          logger.error(errorMsg);
+          this.stats.failedLiquidations++;
+          return { success: false, error: errorMsg };
         }
-      } catch (verifyError: any) {
-        const verifyTime = Date.now() - verifyStart;
-        txAcceptedBySequencer = true;
         this.nonceManager.confirmNonce(nonce);
-        logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: N/A - ${verifyError.message})`);
+        logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} Accepted by sequencer (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: ${verifyTime}ms)`);
+      } catch (verifyError: any) {
+        release();
+        const errorMsg = `Failed to verify TX with sequencer: ${verifyError.message}`;
+        logger.error(errorMsg);
+        this.stats.failedLiquidations++;
+        return { success: false, error: errorMsg };
       }
-      const waitTimeout = txAcceptedBySequencer ? 60_000 : 5_000;
+      const waitTimeout = 60_000;
       const receipt = await this.publicClient.waitForTransactionReceipt({ 
         hash,
         timeout: waitTimeout,
