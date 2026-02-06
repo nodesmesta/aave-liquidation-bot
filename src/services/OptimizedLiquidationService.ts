@@ -445,11 +445,11 @@ export class OptimizedLiquidationService {
       }
     }
     const resultMap = new Map<string, { params: LiquidationParams; userHealth: UserHealth }>();
-    for (const userHealth of users) {
+    const processingPromises = users.map(async (userHealth) => {
       const userReserves = allUserReservesMap.get(userHealth.user);
-      if (!userReserves) continue;
+      if (!userReserves) return null;
       const bestPair = await this.selectBestPair(userReserves, priceCache);
-      if (!bestPair) continue;
+      if (!bestPair) return null;
       const params = await this.prepareLiquidationParams(
         userHealth.user,
         bestPair.collateral,
@@ -458,7 +458,14 @@ export class OptimizedLiquidationService {
         priceCache
       );
       if (params && params.estimatedValue >= 100) {
-        resultMap.set(userHealth.user, { params, userHealth });
+        return { userHealth, params };
+      }
+      return null;
+    });
+    const processingResults = await Promise.all(processingPromises);
+    for (const result of processingResults) {
+      if (result) {
+        resultMap.set(result.userHealth.user, { params: result.params, userHealth: result.userHealth });
       }
     }
     const elapsed = Date.now() - startTime;
