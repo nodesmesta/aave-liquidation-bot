@@ -100,7 +100,6 @@ export class PriceOracle {
    */
   private initializeWebSocketClient(wssUrl: string): void {
     if (this.wsClient) return;
-    // Override basePreconf to use custom RPC URL
     const customChain: Chain = {
       ...basePreconf,
       rpcUrls: {
@@ -157,9 +156,9 @@ export class PriceOracle {
   async startPriceMonitoring(assets: string[], onPriceChange: (updates: PriceUpdate[]) => void, wssUrl: string): Promise<void> {
     if (this.isMonitoring) return;
     this.initializeWebSocketClient(wssUrl);
-    this.isMonitoring = true;
     await this.setupChainlinkAggregators(assets);
     this.subscribeToChainlinkEvents(assets, onPriceChange);
+    this.isMonitoring = true;
     logger.info(`Monitoring ${this.aggregators.size} Chainlink aggregators`);
   }
 

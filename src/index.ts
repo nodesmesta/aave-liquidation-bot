@@ -28,7 +28,6 @@ class LiquidatorBot {
   private isPriceMonitoring = false;
   private isCheckingUsers = false;
   private isRestarting = false;
-  private pendingUserChecks: Set<string> = new Set();
   private inFlightLiquidations: Set<string> = new Set();
   private priceUpdateTimestamp: number = 0;
 
@@ -139,8 +138,6 @@ class LiquidatorBot {
     logger.info('Stopping Liquidator Bot...');
     this.isPriceMonitoring = false;
     this.isInitialized = false;
-    await this.waitForOngoingChecks(5000);
-    this.pendingUserChecks.clear();
     this.inFlightLiquidations.clear();
     this.isCheckingUsers = false;
     this.priceOracle.stopPriceMonitoring();
@@ -169,7 +166,6 @@ class LiquidatorBot {
    */
   private async restartBot(): Promise<void> {
     if (this.isRestarting) {
-      logger.warn('Restart already in progress, skipped');
       return;
     }
     this.isRestarting = true;
@@ -177,32 +173,6 @@ class LiquidatorBot {
     await this.stop();
     logger.info('Bot stopped gracefully, exiting for systemd restart...');
     process.exit(1);
-  }
-
-  /**
-   * @notice Wait for ongoing user checks to complete
-   * @dev Polls isCheckingUsers flag with timeout to prevent deadlock
-   * @param maxWaitMs Maximum time to wait in milliseconds
-   */
-  private async waitForOngoingChecks(maxWaitMs: number): Promise<void> {
-    if (!this.isCheckingUsers) return;
-    const startTime = Date.now();
-    while (this.isCheckingUsers && (Date.now() - startTime) < maxWaitMs) {
-      await this.delay(100);
-    }
-    if (this.isCheckingUsers) {
-      logger.warn(`User checks still ongoing after ${maxWaitMs}ms timeout`);
-      this.isCheckingUsers = false;
-    }
-  }
-
-  /**
-   * @notice Delay helper for async operations
-   * @dev Simple Promise-based delay
-   * @param ms Milliseconds to delay
-   */
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
   }
 
   /**
@@ -354,51 +324,6 @@ class LiquidatorBot {
     }
   }
 
-  /**
-   * @notice Check health factors for tracked users and execute liquidations
-   * @dev Batch-checks users, removes safe users, filters liquidatable, executes liquidations
-   * @param userAddresses Array of user addresses to check
-   */
-  private async checkTrackedUsers(userAddresses: string[]): Promise<void> {
-    if (userAddresses.length === 0) return;
-    const healthCheckStart = Date.now();
-    const healthMap = await this.healthChecker.checkUsers(userAddresses);
-    const healthCheckLatency = Date.now() - healthCheckStart;
-    let removedCount = 0;
-    for (const [address, health] of healthMap.entries()) {
-      const shortAddress = `${address.slice(0, 6)}...${address.slice(-4)}`;
-      if (health.healthFactor >= 1.1) {
-        this.userPool.removeUser(address);
-        removedCount++;
-        logger.debug(`Removed ${shortAddress} from pool (HF ${health.healthFactor.toFixed(4)} >= 1.1 threshold)`);
-      } else {
-        this.userPool.updateUserHF(address, health.healthFactor);
-      }
-    }
-    if (removedCount > 0) {
-      logger.info(`Removed ${removedCount} recovered users from pool (HF >= 1.1)`);
-    }
-      const liquidatable = this.healthChecker.filterLiquidatable(healthMap);
-      if (liquidatable.length === 0) return;
-      const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
-      logger.info(`Found ${liquidatable.length} liquidatable users (health check: ${healthCheckLatency}ms, elapsed: ${elapsedSincePriceUpdate}ms)`);
-      const availableUsers = liquidatable.filter(userHealth => {
-        if (this.inFlightLiquidations.has(userHealth.user)) {
-          logger.debug(`Skipping ${userHealth.user} - already being liquidated`);
-          return false;
-        }
-        return true;
-      });
-      if (availableUsers.length === 0) {
-        logger.info('All liquidatable users already in-flight, skipping');
-        return;
-      }
-      const selection = await this.selectBestLiquidation(availableUsers);
-      if (!selection) return;
-      const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
-      if (success) await this.restart();
-  }
-
   private async selectBestLiquidation(
     users: UserHealth[]
   ): Promise<{ user: UserHealth; params: LiquidationParams; gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint } } | null> {
@@ -423,35 +348,16 @@ class LiquidatorBot {
     const balance = await this.publicClient.getBalance({ address: this.account.address });
     const balanceLatency = Date.now() - balanceStart;
     const balanceETH = Number(formatEther(balance));
-    
-    // Get base gas price once (inline calculation to avoid method overhead)
-    const gasPriceStart = Date.now();
-    const gasPrice = await this.executor['gasManager']['getGasPrice']();
-    const gasPriceLatency = Date.now() - gasPriceStart;
-    const baseFee = gasPrice;
     const fixedGasLimit = 920000n;
-    
-    // Find first affordable liquidation (best that we can afford)
     let skippedCount = 0;
     for (const liq of validLiquidations) {
-      // Inline gas calculation (avoid method call overhead)
-      const basePriorityFee = 1_000_000_000n; // 1 gwei
-      const valueAbove100 = Math.max(0, liq.params.estimatedValue - 100);
-      const additionalPriorityGwei = valueAbove100 * 0.01;
-      const additionalPriorityWei = BigInt(Math.floor(additionalPriorityGwei * 1e9));
-      const priorityFee = basePriorityFee + additionalPriorityWei;
-      const maxFeePerGas = (baseFee * 110n) / 100n + priorityFee;
-      const gasSettings = {
-        maxFeePerGas,
-        maxPriorityFeePerGas: priorityFee,
-        gas: fixedGasLimit,
-      };
-      
+      const gasSettings = await this.executor['gasManager'].getOptimalGasSettings(
+        fixedGasLimit,
+        liq.params.estimatedValue
+      );
       const maxGasCostWei = fixedGasLimit * gasSettings.maxFeePerGas;
       const maxGasCostETH = Number(formatEther(maxGasCostWei));
-      
       if (balanceETH >= maxGasCostETH) {
-        // Found best affordable liquidation
         const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
         logger.info(
           `Selected best affordable of ${validLiquidations.length} liquidations` +
@@ -459,7 +365,7 @@ class LiquidatorBot {
           `${liq.params.collateralSymbol}→${liq.params.debtSymbol} ` +
           `(HF: ${liq.userHealth.healthFactor.toFixed(4)}, value: $${liq.params.estimatedValue.toFixed(0)}, ` +
           `gas: ${maxGasCostETH.toFixed(6)} ETH, ` +
-          `timing: params=${paramsLatency}ms balance=${balanceLatency}ms gasPrice=${gasPriceLatency}ms, ` +
+          `timing: params=${paramsLatency}ms balance=${balanceLatency}ms, ` +
           `elapsed: ${elapsedSincePriceUpdate}ms)`
         );
         return { user: liq.userHealth, params: liq.params, gasSettings };
@@ -485,31 +391,27 @@ class LiquidatorBot {
    * @dev Called periodically and can be read by external monitoring tools
    */
   private async exportUserPoolSnapshot(): Promise<void> {
-    try {
-      const stats = this.userPool.getStats();
-      const users = this.userPool.getAllUsers();
-      
-      const snapshot = {
-        timestamp: Date.now(),
-        stats,
-        users: users.map(u => ({
-          address: u.address,
-          collateralAssets: u.collateralAssets,
-          debtAssets: u.debtAssets,
-          collateralUSD: u.collateralUSD,
-          debtUSD: u.debtUSD,
-          lastCheckedHF: u.lastCheckedHF,
-          lastUpdated: u.lastUpdated,
-          addedAt: u.addedAt,
-        })),
-      };
-      
-      const snapshotPath = path.join(__dirname, '../userpool_snapshot.json');
-      await fs.writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
-      logger.debug(`Snapshoot createdt: ${users.length} users`);
-    } catch (error) {
-      logger.error('Failed to export UserPool snapshot:', error);
-    }
+    const stats = this.userPool.getStats();
+    const users = this.userPool.getAllUsers();
+    
+    const snapshot = {
+      timestamp: Date.now(),
+      stats,
+      users: users.map(u => ({
+        address: u.address,
+        collateralAssets: u.collateralAssets,
+        debtAssets: u.debtAssets,
+        collateralUSD: u.collateralUSD,
+        debtUSD: u.debtUSD,
+        lastCheckedHF: u.lastCheckedHF,
+        lastUpdated: u.lastUpdated,
+        addedAt: u.addedAt,
+      })),
+    };
+    
+    const snapshotPath = path.join(__dirname, '../userpool_snapshot.json');
+    await fs.writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
+    logger.debug(`Snapshoot createdt: ${users.length} users`);
   }
 
   private async executeLiquidationWithParams(
