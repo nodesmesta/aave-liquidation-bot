@@ -27,7 +27,6 @@ export class GasManager {
    */
   async initialize(): Promise<void> {
     try {
-      // Override basePreconf to use custom RPC URL
       const customChain: Chain = {
         ...basePreconf,
         rpcUrls: {
@@ -45,29 +44,22 @@ export class GasManager {
 
       const initialGasPrice = await this.publicClient.getGasPrice();
       this.cachedGasPrice = initialGasPrice;
-      logger.info(`GasManager initialized with gas price: ${initialGasPrice.toString()} wei`);
 
       this.unsubscribeFn = await this.wsClient.watchBlocks({
-        onBlock: async (block: any) => {
-          try {
-            const gasPrice = await this.wsClient.getGasPrice();
-            this.cachedGasPrice = gasPrice;
-          } catch (error) {
-            logger.error('Failed to update gas price from WebSocket:', error);
+        onBlock: (block: any) => {
+          if (block.baseFeePerGas) {
+            this.cachedGasPrice = block.baseFeePerGas;
           }
         },
         onError: (error: Error) => {
-          logger.error('WebSocket gas price subscription error:', error);
+          this.cachedGasPrice = null;
         },
       });
 
       this.isSubscribed = true;
-      logger.info('Gas price WebSocket subscription active');
     } catch (error) {
-      logger.error('Failed to initialize gas price subscription:', error);
       const fallbackGasPrice = await this.publicClient.getGasPrice();
       this.cachedGasPrice = fallbackGasPrice;
-      logger.warn('Using fallback RPC mode for gas price');
     }
   }
 
@@ -80,7 +72,6 @@ export class GasManager {
     if (this.cachedGasPrice !== null) {
       return this.cachedGasPrice;
     }
-    logger.warn('Gas price cache miss, fetching from RPC');
     const gasPrice = await this.publicClient.getGasPrice();
     this.cachedGasPrice = gasPrice;
     return gasPrice;
@@ -95,7 +86,6 @@ export class GasManager {
       this.unsubscribeFn = null;
     }
     this.isSubscribed = false;
-    logger.info('Gas price WebSocket subscription closed');
   }
 
   /**
