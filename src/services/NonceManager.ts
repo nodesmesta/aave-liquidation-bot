@@ -32,7 +32,8 @@ export class NonceManager {
   }
 
   /**
-   * @notice Get next available nonce (thread-safe)
+   * @notice Get next available nonce (sequential execution)
+   * @dev Allocates nonce but does NOT increment currentNonce until confirmNonce()
    * @return Object with nonce and release callback for failed transactions
    */
   async getNextNonce(): Promise<{
@@ -43,25 +44,26 @@ export class NonceManager {
       await this.initialize();
     }
     const nonce = this.currentNonce!;
-    this.currentNonce!++;
     this.pendingNonces.add(nonce);
     
     logger.debug(`[NonceManager] Allocated nonce: ${nonce} (pending: ${this.pendingNonces.size})`);
     const release = () => {
       this.pendingNonces.delete(nonce);
-      logger.debug(`[NonceManager] Released nonce: ${nonce}`);
+      logger.debug(`[NonceManager] Released nonce: ${nonce} - TX failed before sequencer acceptance`);
     };
     
     return { nonce, release };
   }
 
   /**
-   * @notice Mark nonce as confirmed (TX successfully broadcasted)
+   * @notice Mark nonce as confirmed and increment for next TX
+   * @dev ONLY increment currentNonce after sequencer confirms TX acceptance
    * @param nonce The nonce to confirm
    */
   confirmNonce(nonce: number): void {
     this.pendingNonces.delete(nonce);
-    logger.debug(`[NonceManager] Confirmed nonce: ${nonce} (pending: ${this.pendingNonces.size})`);
+    this.currentNonce!++;
+    logger.debug(`[NonceManager] Confirmed nonce: ${nonce}, next: ${this.currentNonce} (pending: ${this.pendingNonces.size})`);
   }
 
   /**

@@ -1,4 +1,4 @@
-import { createPublicClient, http, formatEther, formatUnits, Chain } from 'viem';
+import { createPublicClient, http, formatEther, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config, validateConfig, getAssetSymbol } from './config';
 import * as fs from 'fs/promises';
@@ -15,7 +15,6 @@ import { SupportedAsset } from './config/assets';
 import { LiquidationParams } from './services/OptimizedLiquidationService';
 
 class LiquidatorBot {
-  private rpcUrl: string;
   private publicClient: any;
   private account: ReturnType<typeof createAccount>;
   private healthChecker: HealthChecker;
@@ -32,7 +31,6 @@ class LiquidatorBot {
   private priceUpdateTimestamp: number = 0;
 
   constructor() {
-    this.rpcUrl = config.network.rpcUrl;
     const customChain: Chain = {
       ...basePreconf,
       rpcUrls: {
@@ -259,11 +257,8 @@ class LiquidatorBot {
       const totalAffected = allAffectedUsers.size;
       const highRiskCount = highRiskUsers.size;
       if (totalAffected > 0) {
-        logger.info(
-          `${assetSymbol} ${update.percentChange > 0 ? '↑' : '↓'}${Math.abs(update.percentChange).toFixed(2)}% ` +
-          `($${update.oldPrice.toFixed(2)} → $${update.newPrice.toFixed(2)}) affects ` +
-          `${totalAffected} users (${highRiskCount} high-risk HF<=1.03, ${totalAffected - highRiskCount} others)`
-        );
+        const direction = update.percentChange > 0 ? '↑' : '↓';
+        logger.info(`${assetSymbol} ${direction}${Math.abs(update.percentChange).toFixed(2)}% ($${update.oldPrice.toFixed(2)}→$${update.newPrice.toFixed(2)}) affects ${totalAffected} users (${highRiskCount} high-risk)`);
       }
     }
     if (!this.isCheckingUsers && highRiskUsers.size > 0) {
@@ -289,8 +284,7 @@ class LiquidatorBot {
       const highRiskCheckLatency = Date.now() - highRiskCheckStart;
       const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
       if (liquidatable.length > 0) {
-        const elapsedAfterCheck = Date.now() - this.priceUpdateTimestamp;
-        logger.info(`Found ${liquidatable.length} liquidatable users in high-risk check (check: ${highRiskCheckLatency}ms, elapsed: ${elapsedAfterCheck}ms)`);
+        logger.info(`Found ${liquidatable.length} liquidatable (check: ${highRiskCheckLatency}ms)`);
         const availableUsers = liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
         if (availableUsers.length > 0) {
           const selection = await this.selectBestLiquidation(availableUsers);
@@ -314,8 +308,7 @@ class LiquidatorBot {
           this.userPool.updateUserHF(address, health.healthFactor);
         }
       }
-      const totalElapsed = Date.now() - this.priceUpdateTimestamp;
-      logger.info(`Cache updated (${removedCount} removed, check: ${cacheUpdateLatency}ms, total elapsed: ${totalElapsed}ms)`);
+      logger.info(`Cache updated (${removedCount} removed, ${cacheUpdateLatency}ms)`);
     } catch (error) {
       logger.error('Error in two-phase health check:', error);
     } finally {
@@ -341,46 +334,29 @@ class LiquidatorBot {
       return a.userHealth.healthFactor - b.userHealth.healthFactor;
     });
     
-    const balanceStart = Date.now();
     const balance = await this.publicClient.getBalance({ address: this.account.address });
-    const balanceLatency = Date.now() - balanceStart;
     const balanceETH = Number(formatEther(balance));
     const fixedGasLimit = 920000n;
-    const gasPrice = await this.executor['gasManager'].getGasPrice();
     let skippedCount = 0;
+    
     for (const liq of validLiquidations) {
-      const gasSettings = this.executor['gasManager'].calculateGasSettings(
-        gasPrice,
+      const gasResult = await this.executor.calculateAffordableGasSettings(
         fixedGasLimit,
-        liq.params.estimatedValue
+        liq.params.estimatedValue,
+        balanceETH
       );
-      const maxGasCostWei = fixedGasLimit * gasSettings.maxFeePerGas;
-      const maxGasCostETH = Number(formatEther(maxGasCostWei));
-      if (balanceETH >= maxGasCostETH) {
-        const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
-        logger.info(
-          `Selected best affordable of ${validLiquidations.length} liquidations` +
-          `${skippedCount > 0 ? ` (skipped ${skippedCount} higher-value due to insufficient balance)` : ''}: ` +
-          `${liq.params.collateralSymbol}→${liq.params.debtSymbol} ` +
-          `(HF: ${liq.userHealth.healthFactor.toFixed(4)}, value: $${liq.params.estimatedValue.toFixed(0)}, ` +
-          `gas: ${maxGasCostETH.toFixed(6)} ETH, ` +
-          `timing: params=${paramsLatency}ms balance=${balanceLatency}ms, ` +
-          `elapsed: ${elapsedSincePriceUpdate}ms)`
-        );
-        return { user: liq.userHealth, params: liq.params, gasSettings };
+      
+      if (gasResult) {
+        const skip = skippedCount > 0 ? ` (skipped ${skippedCount})` : '';
+        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH (${paramsLatency}ms)`);
+        return { user: liq.userHealth, params: liq.params, gasSettings: gasResult.gasSettings };
       } else {
         skippedCount++;
-        logger.debug(
-          `Skipping #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} (value: $${liq.params.estimatedValue.toFixed(0)}): ` +
-          `insufficient balance (have: ${balanceETH.toFixed(6)} ETH, need: ${maxGasCostETH.toFixed(6)} ETH)`
-        );
+        logger.debug(`Skip #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} ($${liq.params.estimatedValue.toFixed(0)}): insufficient balance`);
       }
     }
     
-    logger.warn(
-      `No affordable liquidations (balance: ${balanceETH.toFixed(6)} ETH, ` +
-      `all ${validLiquidations.length} opportunities need more funds)`
-    );
+    logger.warn(`No affordable liquidations: balance ${balanceETH.toFixed(6)}ETH insufficient for ${validLiquidations.length} opportunities`);
     return null;
   }
 
@@ -419,10 +395,6 @@ class LiquidatorBot {
   ): Promise<boolean> {
     this.inFlightLiquidations.add(userHealth.user);
     try {
-      const executionStart = Date.now();
-      const elapsedBeforeExecution = executionStart - this.priceUpdateTimestamp;
-      logger.info(`Starting execution (elapsed since price update: ${elapsedBeforeExecution}ms)`);
-      
       const tx = await this.executor.executeLiquidation(
         params.collateralAsset,
         params.debtAsset,
@@ -431,14 +403,9 @@ class LiquidatorBot {
         params.estimatedValue,
         gasSettings
       );
-      const executionLatency = Date.now() - executionStart;
       const totalLatency = Date.now() - this.priceUpdateTimestamp;
       if (tx.success) {
-        logger.info(
-          `✓ Liquidated: ${tx.txHash} | ` +
-          `Execution: ${executionLatency}ms | ` +
-          `Total (price→tx): ${totalLatency}ms`
-        );
+        logger.info(`✓ Liquidated ${tx.txHash} (price→tx: ${totalLatency}ms)`);
         return true;
       }
       return false;
