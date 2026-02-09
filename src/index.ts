@@ -48,8 +48,7 @@ class LiquidatorBot {
     this.healthChecker = new HealthChecker(config.network.rpcUrl, config.aave.pool);
     this.executor = new LiquidationExecutor(
       config.network.rpcUrl,
-      this.account,
-      config.network.wssUrl
+      this.account
     );
     this.priceOracle = new PriceOracle(this.publicClient);
     this.subgraphService = new SubgraphService(config.aave.subgraphUrl);
@@ -335,7 +334,6 @@ class LiquidatorBot {
       return null;
     }
     
-    // Sort by value first (best to worst)
     const validLiquidations = Array.from(paramsMap.values());
     validLiquidations.sort((a, b) => {
       const valueDiff = b.params.estimatedValue - a.params.estimatedValue;
@@ -343,15 +341,16 @@ class LiquidatorBot {
       return a.userHealth.healthFactor - b.userHealth.healthFactor;
     });
     
-    // Get wallet balance once
     const balanceStart = Date.now();
     const balance = await this.publicClient.getBalance({ address: this.account.address });
     const balanceLatency = Date.now() - balanceStart;
     const balanceETH = Number(formatEther(balance));
     const fixedGasLimit = 920000n;
+    const gasPrice = await this.executor['gasManager'].getGasPrice();
     let skippedCount = 0;
     for (const liq of validLiquidations) {
-      const gasSettings = await this.executor['gasManager'].getOptimalGasSettings(
+      const gasSettings = this.executor['gasManager'].calculateGasSettings(
+        gasPrice,
         fixedGasLimit,
         liq.params.estimatedValue
       );
@@ -378,7 +377,6 @@ class LiquidatorBot {
       }
     }
     
-    // No affordable liquidation found
     logger.warn(
       `No affordable liquidations (balance: ${balanceETH.toFixed(6)} ETH, ` +
       `all ${validLiquidations.length} opportunities need more funds)`

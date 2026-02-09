@@ -1,24 +1,17 @@
 import { logger } from '../utils/logger';
 
-/**
- * Represents a user being tracked for liquidation opportunities
- */
 export interface TrackedUser {
   address: string;
-  collateralAssets: string[];     // e.g., ['WETH', 'USDC', 'cbBTC']
-  debtAssets: string[];           // e.g., ['WETH', 'USDC']
-  collateralUSD: number;          // Total collateral value in USD
-  debtUSD: number;                // Total debt value in USD
-  estimatedHF: number;            // Health factor from subgraph
-  lastCheckedHF: number;          // Last on-chain health factor
-  lastUpdated: number;            // Timestamp of last check
-  addedAt: number;                // Timestamp when added to pool
+  collateralAssets: string[];
+  debtAssets: string[];
+  collateralUSD: number;
+  debtUSD: number;
+  estimatedHF: number;
+  lastCheckedHF: number;
+  lastUpdated: number;
+  addedAt: number;
 }
 
-/**
- * UserPool manages a collection of users being monitored for liquidation
- * In-memory storage that gets cleared and refreshed after successful liquidations
- */
 export class UserPool {
   private users: Map<string, TrackedUser>;
   
@@ -54,16 +47,6 @@ export class UserPool {
       logger.info(`Removed user ${normalizedAddress} from pool`);
     }
     return removed;
-  }
-
-  /**
-   * @notice Get a specific user from the pool
-   * @dev Returns undefined if user not found
-   * @param address User address to retrieve
-   * @return User data or undefined
-   */
-  getUser(address: string): TrackedUser | undefined {
-    return this.users.get(address.toLowerCase());
   }
 
   /**
@@ -126,57 +109,17 @@ export class UserPool {
   }
 
   /**
-   * @notice Get users with HF below a threshold (from last check)
-   * @dev Sorts by health factor ascending (most risky first)
-   * @param maxHF Maximum health factor threshold
-   * @return Array of users sorted by HF
-   */
-  getUsersByHF(maxHF: number): TrackedUser[] {
-    return this.getAllUsers()
-      .filter(user => user.lastCheckedHF < maxHF)
-      .sort((a, b) => a.lastCheckedHF - b.lastCheckedHF);
-  }
-
-  /**
    * @notice Update a user's on-chain health factor
    * @dev Updates lastCheckedHF and lastUpdated timestamp
    * @param address User address
    * @param healthFactor New health factor value
    */
   updateUserHF(address: string, healthFactor: number): void {
-    const user = this.getUser(address);
+    const user = this.users.get(address.toLowerCase());
     if (user) {
       user.lastCheckedHF = healthFactor;
       user.lastUpdated = Date.now();
     }
-  }
-
-  /**
-   * @notice Clear all users from the pool
-   * @dev Logs number of users cleared
-   */
-  clear(): void {
-    const count = this.users.size;
-    this.users.clear();
-    logger.info(`Cleared ${count} users from pool`);
-  }
-
-  /**
-   * @notice Get the number of users in the pool
-   * @dev Returns current pool size
-   * @return Number of tracked users
-   */
-  size(): number {
-    return this.users.size;
-  }
-
-  /**
-   * @notice Check if pool is empty
-   * @dev Returns true if no users are tracked
-   * @return True if pool is empty
-   */
-  isEmpty(): boolean {
-    return this.users.size === 0;
   }
 
   /**

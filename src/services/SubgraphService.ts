@@ -132,16 +132,12 @@ export class SubgraphService {
           if (hasCollateral) collateralAssets.push(symbol);
           if (hasDebt) debtAssets.push(symbol);
         }
-        
-        // Filter stablecoin-only positions (low volatility, low liquidation risk)
         const allStablecoinCollateral = collateralAssets.every(a => this.STABLE_ASSETS.has(a));
         const allStablecoinDebt = debtAssets.every(a => this.STABLE_ASSETS.has(a));
         if (allStablecoinCollateral && allStablecoinDebt) {
           filteredByStablecoin++;
           continue;
         }
-        
-        // Include users with volatile assets (cross-asset or unhedged exposure)
         const hasUnhedgedCollateral = collateralAssets.some(c => !debtAssets.includes(c));
         const hasCrossAssetDebt = debtAssets.some(d => !collateralAssets.includes(d));
         if (hasUnhedgedCollateral || hasCrossAssetDebt) {
@@ -236,8 +232,6 @@ export class SubgraphService {
         const start = batchIndex * BATCH_SIZE;
         const end = Math.min(start + BATCH_SIZE, userAddresses.length);
         const batchAddresses = userAddresses.slice(start, end);
-        
-        // Rate limiting: delay between batches
         if (batchIndex > 0) {
           await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
         }
@@ -255,12 +249,10 @@ export class SubgraphService {
             contracts: accountDataCalls,
           });
         } catch (error: any) {
-          // Handle rate limit errors with exponential backoff
           if (error.code === 429 || error.message?.includes('compute units')) {
             const backoffMs = Math.min(BATCH_DELAY_MS * Math.pow(2, batchIndex % 5), 5000);
             logger.warn(`Rate limit hit at batch ${batchIndex + 1}, backing off ${backoffMs}ms...`);
             await new Promise(resolve => setTimeout(resolve, backoffMs));
-            // Retry once
             accountDataResults = await client.multicall({
               contracts: accountDataCalls,
             });
@@ -301,8 +293,6 @@ export class SubgraphService {
         const start = batchIndex * BATCH_SIZE;
         const end = Math.min(start + BATCH_SIZE, atRiskUsers.length);
         const batchUsers = atRiskUsers.slice(start, end);
-        
-        // Rate limiting: delay between batches
         if (batchIndex > 0) {
           await new Promise(resolve => setTimeout(resolve, BATCH_DELAY_MS));
         }
@@ -320,12 +310,10 @@ export class SubgraphService {
             contracts: userConfigCalls,
           });
         } catch (error: any) {
-          // Handle rate limit errors with exponential backoff
           if (error.code === 429 || error.message?.includes('compute units')) {
             const backoffMs = Math.min(BATCH_DELAY_MS * Math.pow(2, batchIndex % 5), 5000);
             logger.warn(`Rate limit hit at asset validation batch ${batchIndex + 1}, backing off ${backoffMs}ms...`);
             await new Promise(resolve => setTimeout(resolve, backoffMs));
-            // Retry once
             userConfigResults = await client.multicall({
               contracts: userConfigCalls,
             });
@@ -405,13 +393,7 @@ export class SubgraphService {
             filteredByHedging++;
             continue;
           }
-          const hasUnhedgedExposure = collateralAssets.some(c => !debtAssets.includes(c)) ||
-            debtAssets.some(d => !collateralAssets.includes(d));
-          let shouldInclude = false;
           if (user.hf < 1.075) {
-            shouldInclude = true;
-          }
-          if (shouldInclude) {
             results.set(user.address.toLowerCase(), {
               hf: user.hf,
               collateral: user.collateral,

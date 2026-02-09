@@ -24,8 +24,6 @@ export class HealthChecker {
   constructor(rpcUrl?: string, poolAddress?: string) {
     const resolvedRpcUrl = rpcUrl || config.network.rpcUrl;
     this.poolAddress = poolAddress || config.aave.pool;
-    // Use base chain for read-only operations (better multicall compatibility)
-    // basePreconf only needed for TX execution, not for read calls
     this.publicClient = createPublicClient({
       chain: base,
       transport: http(resolvedRpcUrl),

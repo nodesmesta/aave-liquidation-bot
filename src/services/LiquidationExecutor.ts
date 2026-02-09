@@ -26,7 +26,6 @@ export class LiquidationExecutor {
   private publicClient: any;
   private gasManager: GasManager;
   private nonceManager: NonceManager;
-  private wssUrl: string;
   private chain: Chain;
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
@@ -42,9 +41,8 @@ export class LiquidationExecutor {
     consecutiveLosses: 0,
   };
 
-  constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>, wssUrl?: string) {
+  constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>) {
     this.account = account || createAccount();
-    this.wssUrl = wssUrl || rpcUrl.replace('https://', 'wss://').replace('http://', 'ws://');
     this.chain = basePreconf;
     this.walletClient = viemCreateWalletClient({
       account: this.account,
@@ -55,7 +53,7 @@ export class LiquidationExecutor {
       chain: this.chain,
       transport: http(rpcUrl),
     });
-    this.gasManager = new GasManager(this.publicClient, this.wssUrl);
+    this.gasManager = new GasManager(this.publicClient);
     this.nonceManager = new NonceManager(this.publicClient, this.account.address);
     if (!config.liquidator.address) {
       throw new Error('Liquidator contract address not configured');
@@ -68,7 +66,6 @@ export class LiquidationExecutor {
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
-    await this.gasManager.initialize();
     const walletRpcUrl = this.walletClient.transport.url || 'unknown';
     const publicRpcUrl = this.publicClient.transport.url || 'unknown';
     logger.info(`walletClient (TX broadcast): ${walletRpcUrl}`);
@@ -100,14 +97,12 @@ export class LiquidationExecutor {
     user: string,
     debtToCover: bigint,
     estimatedValue: number,
-    gasSettings?: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
+    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
     try {
       logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
-      const fixedGasLimit = 920000n;
-      const finalGasSettings = gasSettings || await this.gasManager.getOptimalGasSettings(fixedGasLimit, estimatedValue);
       const prepareStart = Date.now();
       const data = encodeFunctionData({
         abi: this.liquidatorAbi,
@@ -120,9 +115,9 @@ export class LiquidationExecutor {
         to: config.liquidator.address as Address,
         data,
         nonce,
-        maxFeePerGas: finalGasSettings.maxFeePerGas,
-        maxPriorityFeePerGas: finalGasSettings.maxPriorityFeePerGas,
-        gas: finalGasSettings.gas,
+        maxFeePerGas: gasSettings.maxFeePerGas,
+        maxPriorityFeePerGas: gasSettings.maxPriorityFeePerGas,
+        gas: gasSettings.gas,
         chainId: this.chain.id,
       });
       const signTime = Date.now() - signStart;

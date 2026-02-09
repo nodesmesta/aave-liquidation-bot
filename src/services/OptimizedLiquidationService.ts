@@ -145,10 +145,10 @@ export class OptimizedLiquidationService {
     logger.info(`Reserve config cache warmed up: ${this.reserveConfigCache.size} assets cached`);
   }
 
-  async selectBestPair(
+  selectBestPair(
     userReserves: UserReserveData[],
-    priceCache?: Map<string, number>
-  ): Promise<{ collateral: UserReserveData; debt: UserReserveData } | null> {
+    priceCache: Map<string, number>
+  ): { collateral: UserReserveData; debt: UserReserveData } | null {
     const collaterals = userReserves.filter(
       r => r.collateralBalance > 0n && 
            r.usageAsCollateralEnabled &&
@@ -157,15 +157,6 @@ export class OptimizedLiquidationService {
     const debts = userReserves.filter(r => r.debtBalance > 0n);
     if (collaterals.length === 0 || debts.length === 0) {
       return null;
-    }
-    
-    let priceMap: Map<string, number>;
-    if (priceCache) {
-      priceMap = priceCache;
-    } else {
-      const allAssets = [...collaterals, ...debts].map(r => r.asset);
-      const uniqueAssets = [...new Set(allAssets)];
-      priceMap = await this.priceOracle.getAssetsPrices(uniqueAssets);
     }
     const validPairs: Array<{ 
       collateral: UserReserveData; 
@@ -176,8 +167,8 @@ export class OptimizedLiquidationService {
     }> = [];
     for (const collateral of collaterals) {
       for (const debt of debts) {
-        const collateralPrice = priceMap.get(collateral.asset);
-        const debtPrice = priceMap.get(debt.asset);
+        const collateralPrice = priceCache.get(collateral.asset);
+        const debtPrice = priceCache.get(debt.asset);
         if (!collateralPrice || !debtPrice) {
           continue;
         }
@@ -190,12 +181,10 @@ export class OptimizedLiquidationService {
         const collateralValueUSD = collateralAmount * collateralPrice;
         const debtValueUSD = debtAmount * debtPrice;
         
-        // Calculate max debt that can be covered by available collateral
         const liquidationBonusMultiplier = 1 + (collateral.liquidationBonus / 100);
         const maxDebtValueUSD = collateralValueUSD / liquidationBonusMultiplier;
         const maxDebtToCoverUSD = Math.min(debtValueUSD, maxDebtValueUSD);
         
-        // Only consider pairs where we can liquidate at least $10 of debt
         if (maxDebtToCoverUSD >= 10) {
           const estimatedProfitUSD = maxDebtToCoverUSD * (collateral.liquidationBonus / 100);
           validPairs.push({
@@ -213,7 +202,6 @@ export class OptimizedLiquidationService {
       return null;
     }
     
-    // Select pair with highest estimated value (profit potential)
     const bestPair = validPairs.reduce((best, current) => 
       current.estimatedValue > best.estimatedValue ? current : best
     );
@@ -236,25 +224,19 @@ export class OptimizedLiquidationService {
    * @param collateral Collateral reserve data from protocol
    * @param debt Debt reserve data from protocol
    * @param healthFactor User's current health factor
-   * @param priceCache Optional pre-fetched price map to avoid redundant RPC calls
+   * @param priceCache Pre-fetched price map to avoid redundant RPC calls
    * @return Complete liquidation parameters for execution
    */
-  async prepareLiquidationParams(
+  prepareLiquidationParams(
     userAddress: string,
     collateral: UserReserveData,
     debt: UserReserveData,
     healthFactor: number,
-    priceCache?: Map<string, number>
-  ): Promise<LiquidationParams | null> {
+    priceCache: Map<string, number>
+  ): LiquidationParams | null {
     const totalDebt = debt.debtBalance;
-    let priceMap: Map<string, number>;
-    if (priceCache) {
-      priceMap = priceCache;
-    } else {
-      priceMap = await this.priceOracle.getAssetsPrices([collateral.asset, debt.asset]);
-    }
-    const collateralPrice = priceMap.get(collateral.asset);
-    const debtPrice = priceMap.get(debt.asset);
+    const collateralPrice = priceCache.get(collateral.asset);
+    const debtPrice = priceCache.get(debt.asset);
 
     if (!collateralPrice || !debtPrice) {
       logger.error('Cannot get prices for liquidation calculation');
@@ -445,12 +427,12 @@ export class OptimizedLiquidationService {
       }
     }
     const resultMap = new Map<string, { params: LiquidationParams; userHealth: UserHealth }>();
-    const processingPromises = users.map(async (userHealth) => {
+    for (const userHealth of users) {
       const userReserves = allUserReservesMap.get(userHealth.user);
-      if (!userReserves) return null;
-      const bestPair = await this.selectBestPair(userReserves, priceCache);
-      if (!bestPair) return null;
-      const params = await this.prepareLiquidationParams(
+      if (!userReserves) continue;
+      const bestPair = this.selectBestPair(userReserves, priceCache);
+      if (!bestPair) continue;
+      const params = this.prepareLiquidationParams(
         userHealth.user,
         bestPair.collateral,
         bestPair.debt,
@@ -458,14 +440,7 @@ export class OptimizedLiquidationService {
         priceCache
       );
       if (params && params.estimatedValue >= 100) {
-        return { userHealth, params };
-      }
-      return null;
-    });
-    const processingResults = await Promise.all(processingPromises);
-    for (const result of processingResults) {
-      if (result) {
-        resultMap.set(result.userHealth.user, { params: result.params, userHealth: result.userHealth });
+        resultMap.set(userHealth.user, { params, userHealth });
       }
     }
     const elapsed = Date.now() - startTime;

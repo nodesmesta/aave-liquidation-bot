@@ -27,13 +27,6 @@ export class PriceOracle {
   private readonly AAVE_ORACLE: `0x${string}`;
   private ORACLE_ABI = [
     {
-      inputs: [{ name: 'asset', type: 'address' }],
-      name: 'getAssetPrice',
-      outputs: [{ name: '', type: 'uint256' }],
-      stateMutability: 'view',
-      type: 'function',
-    },
-    {
       inputs: [{ name: 'assets', type: 'address[]' }],
       name: 'getAssetsPrices',
       outputs: [{ name: '', type: 'uint256[]' }],
@@ -61,22 +54,8 @@ export class PriceOracle {
     },
     {
       inputs: [],
-      name: 'latestAnswer',
-      outputs: [{ name: '', type: 'int256' }],
-      stateMutability: 'view',
-      type: 'function',
-    },
-    {
-      inputs: [],
       name: 'decimals',
       outputs: [{ name: '', type: 'uint8' }],
-      stateMutability: 'view',
-      type: 'function',
-    },
-    {
-      inputs: [],
-      name: 'description',
-      outputs: [{ name: '', type: 'string' }],
       stateMutability: 'view',
       type: 'function',
     },

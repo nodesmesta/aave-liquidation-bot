@@ -4,7 +4,6 @@ import { AaveV3Base } from '@bgd-labs/aave-address-book';
 dotenv.config();
 
 export const config = {
-  // Network
   network: {
     rpcUrl: process.env.BASE_RPC_URL || '',
     wssUrl: process.env.BASE_WSS_URL || '',
