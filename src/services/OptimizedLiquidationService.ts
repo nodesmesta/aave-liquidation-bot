@@ -32,6 +32,10 @@ export class OptimizedLiquidationService {
   private poolAddress: string;
   private priceOracle: PriceOracle;
   private publicClient: any;
+  private readonly BASE_CURRENCY_DECIMALS = 8;
+  private readonly MIN_LEFTOVER_BASE = 100000000;
+  private readonly SAFETY_MARGIN = 1.1;
+  private readonly MIN_LIQUIDATION_VALUE_USD = 100;
   
   private dataProviderAbi = parseAbi([
     'function getUserReserveData(address asset, address user) external view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)',
@@ -150,20 +154,17 @@ export class OptimizedLiquidationService {
     priceCache: Map<string, number>
   ): { collateral: UserReserveData; debt: UserReserveData } | null {
     const collaterals = userReserves.filter(
-      r => r.collateralBalance > 0n && 
-           r.usageAsCollateralEnabled &&
-           r.liquidationBonus > 0
+      r => r.collateralBalance > 0n && r.usageAsCollateralEnabled && r.liquidationBonus > 0
     );
     const debts = userReserves.filter(r => r.debtBalance > 0n);
     if (collaterals.length === 0 || debts.length === 0) {
       return null;
     }
-    const validPairs: Array<{ 
-      collateral: UserReserveData; 
-      debt: UserReserveData; 
+    const validPairs: Array<{
+      collateral: UserReserveData;
+      debt: UserReserveData;
       bonus: number;
       estimatedValue: number;
-      estimatedProfit: number;
     }> = [];
     for (const collateral of collaterals) {
       for (const debt of debts) {
@@ -180,19 +181,15 @@ export class OptimizedLiquidationService {
         );
         const collateralValueUSD = collateralAmount * collateralPrice;
         const debtValueUSD = debtAmount * debtPrice;
-        
         const liquidationBonusMultiplier = 1 + (collateral.liquidationBonus / 100);
         const maxDebtValueUSD = collateralValueUSD / liquidationBonusMultiplier;
         const maxDebtToCoverUSD = Math.min(debtValueUSD, maxDebtValueUSD);
-        
         if (maxDebtToCoverUSD >= 10) {
-          const estimatedProfitUSD = maxDebtToCoverUSD * (collateral.liquidationBonus / 100);
           validPairs.push({
             collateral,
             debt,
             bonus: collateral.liquidationBonus,
             estimatedValue: maxDebtToCoverUSD * liquidationBonusMultiplier,
-            estimatedProfit: estimatedProfitUSD
           });
         }
       }
@@ -201,15 +198,12 @@ export class OptimizedLiquidationService {
       logger.warn('No valid pairs with sufficient collateral found');
       return null;
     }
-    
-    const bestPair = validPairs.reduce((best, current) => 
+    const bestPair = validPairs.reduce((best, current) =>
       current.estimatedValue > best.estimatedValue ? current : best
     );
-    
     logger.info(
       `Selected: ${bestPair.collateral.symbol}-${bestPair.debt.symbol} ` +
-      `(${validPairs.length} valid pairs, value: $${bestPair.estimatedValue.toFixed(2)}, ` +
-      `profit: $${bestPair.estimatedProfit.toFixed(2)}, bonus: ${bestPair.bonus}%)`
+      `(${validPairs.length} valid pairs, value: $${bestPair.estimatedValue.toFixed(2)}, bonus: ${bestPair.bonus}%)`
     );
     return {
       collateral: bestPair.collateral,
@@ -219,90 +213,61 @@ export class OptimizedLiquidationService {
 
   /**
    * @notice Prepare liquidation parameters with collateral constraint
-   * @dev Aave V3 handles close factor internally (50%/100% based on HF), bot only needs collateral limit
+   * @dev Aave V3 close factor handled by protocol, calculates max debt based on collateral
    * @param userAddress Address of user to liquidate
-   * @param collateral Collateral reserve data from protocol
-   * @param debt Debt reserve data from protocol
-   * @param healthFactor User's current health factor
-   * @param priceCache Pre-fetched price map to avoid redundant RPC calls
-   * @return Complete liquidation parameters for execution
+   * @param collateral Collateral reserve data
+   * @param debt Debt reserve data
+   * @param priceCache Pre-fetched price map for calculation
+   * @return Complete liquidation parameters or null if invalid
    */
   prepareLiquidationParams(
     userAddress: string,
     collateral: UserReserveData,
     debt: UserReserveData,
-    healthFactor: number,
     priceCache: Map<string, number>
   ): LiquidationParams | null {
-    const totalDebt = debt.debtBalance;
     const collateralPrice = priceCache.get(collateral.asset);
     const debtPrice = priceCache.get(debt.asset);
-
     if (!collateralPrice || !debtPrice) {
       logger.error('Cannot get prices for liquidation calculation');
       return null;
     }
-    const collateralAmount = parseFloat(
-      formatUnits(collateral.collateralBalance, collateral.decimals)
-    );
+    const collateralAmount = parseFloat(formatUnits(collateral.collateralBalance, collateral.decimals));
     const collateralValueUSD = collateralAmount * collateralPrice;
     const liquidationBonusMultiplier = 1 + (collateral.liquidationBonus / 100);
     const maxDebtValueUSD = collateralValueUSD / liquidationBonusMultiplier;
     const maxDebtByCollateral = maxDebtValueUSD / debtPrice;
-    const maxDebtByCollateralBN = BigInt(
-      Math.floor(maxDebtByCollateral * 10 ** debt.decimals)
-    );
-    let debtToCover = totalDebt < maxDebtByCollateralBN 
-      ? totalDebt 
-      : maxDebtByCollateralBN;
+    const maxDebtByCollateralBN = BigInt(Math.floor(maxDebtByCollateral * 10 ** debt.decimals));
+    let debtToCover = collateral.collateralBalance === 0n ? 0n : debt.debtBalance < maxDebtByCollateralBN ? debt.debtBalance : maxDebtByCollateralBN;
     if (debtToCover === 0n) {
       logger.warn('Calculated debtToCover is 0, skipping liquidation');
       return null;
     }
-    const BASE_CURRENCY_DECIMALS = 8;
-    const MIN_LEFTOVER_BASE = 100000000;
-    const SAFETY_MARGIN = 1.1;
-    const totalDebtFloat = parseFloat(formatUnits(totalDebt, debt.decimals));
+    const totalDebtFloat = parseFloat(formatUnits(debt.debtBalance, debt.decimals));
     let debtToCoverFloat = parseFloat(formatUnits(debtToCover, debt.decimals));
-    if (debtToCover < totalDebt) {
+    if (debtToCover < debt.debtBalance) {
       const collateralToSeizeUSD = debtToCoverFloat * debtPrice * liquidationBonusMultiplier;
       const collateralToSeize = collateralToSeizeUSD / collateralPrice;
-      if (collateralToSeize < collateralAmount) {
-        const debtLeftover = totalDebtFloat - debtToCoverFloat;
-        const collateralLeftover = collateralAmount - collateralToSeize;
-        const debtLeftoverBase = Math.ceil(debtLeftover * debtPrice * (10 ** BASE_CURRENCY_DECIMALS));
-        const collateralLeftoverBase = Math.ceil(collateralLeftover * collateralPrice * (10 ** BASE_CURRENCY_DECIMALS));
-        const isDebtMoreThanThreshold = debtLeftoverBase >= MIN_LEFTOVER_BASE;
-        const isCollateralMoreThanThreshold = collateralLeftoverBase >= MIN_LEFTOVER_BASE;
-        if (!isDebtMoreThanThreshold || !isCollateralMoreThanThreshold) {
-          const targetLeftoverUSD = SAFETY_MARGIN;
-          const maxDebtByDebtLeftover = totalDebtFloat - (targetLeftoverUSD / debtPrice);
-          const maxDebtByCollateralLeftover = ((collateralValueUSD - targetLeftoverUSD) / liquidationBonusMultiplier) / debtPrice;
-          const adjustedDebtToCover = Math.min(maxDebtByDebtLeftover, maxDebtByCollateralLeftover);
-          debtToCover = BigInt(Math.floor(adjustedDebtToCover * 10 ** debt.decimals));
-          debtToCoverFloat = adjustedDebtToCover;
-          logger.info(
-            `Adjusted for MustNotLeaveDust: debtLeftover=$${(debtLeftoverBase / 1e8).toFixed(2)}, ` +
-            `collateralLeftover=$${(collateralLeftoverBase / 1e8).toFixed(2)} ` +
-            `-> adjusted to leave >= $${targetLeftoverUSD}`
-          );
-        }
+      const debtLeftover = totalDebtFloat - debtToCoverFloat;
+      const collateralLeftover = collateralAmount - collateralToSeize;
+      const debtLeftoverBase = Math.ceil(debtLeftover * debtPrice * (10 ** this.BASE_CURRENCY_DECIMALS));
+      const collateralLeftoverBase = Math.ceil(collateralLeftover * collateralPrice * (10 ** this.BASE_CURRENCY_DECIMALS));
+      if (debtLeftoverBase < this.MIN_LEFTOVER_BASE || collateralLeftoverBase < this.MIN_LEFTOVER_BASE) {
+        const maxDebtByDebtLeftover = totalDebtFloat - (this.SAFETY_MARGIN / debtPrice);
+        const maxDebtByCollateralLeftover = ((collateralValueUSD - this.SAFETY_MARGIN) / liquidationBonusMultiplier) / debtPrice;
+        const adjustedDebtToCover = Math.min(maxDebtByDebtLeftover, maxDebtByCollateralLeftover);
+        debtToCover = BigInt(Math.floor(adjustedDebtToCover * 10 ** debt.decimals));
+        debtToCoverFloat = adjustedDebtToCover;
+        logger.info(`Adjusted for MustNotLeaveDust: debtLeftover=$${(debtLeftoverBase / 1e8).toFixed(2)}, collateralLeftover=$${(collateralLeftoverBase / 1e8).toFixed(2)}`);
       }
     }
     if (debtToCover === 0n) {
       logger.warn('Adjusted debtToCover is 0 after MustNotLeaveDust check, skipping liquidation');
       return null;
     }
-    const debtValue = debtToCoverFloat;
-    const debtToCoverUSD = debtValue * debtPrice;
+    const debtToCoverUSD = debtToCoverFloat * debtPrice;
     const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
-
-    logger.info(
-      `Liquidation calc: totalDebt=${formatUnits(totalDebt, debt.decimals)}, ` +
-      `maxByCollateral=${maxDebtByCollateral.toFixed(4)}, ` +
-      `final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`
-    );
-    
+    logger.info(`Liquidation calc: totalDebt=${formatUnits(debt.debtBalance, debt.decimals)}, maxByCollateral=${maxDebtByCollateral.toFixed(4)}, final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`);
     return {
       userAddress,
       collateralAsset: collateral.asset,
@@ -315,6 +280,7 @@ export class OptimizedLiquidationService {
       estimatedValue: estimatedValueUSD,
     };
   }
+  
   /**
    * @notice Get liquidation params for multiple users in parallel using multicall
    * @dev Optimized: Fetches bitmaps + prices in 1 multicall, then reserves in 2nd multicall
@@ -436,10 +402,9 @@ export class OptimizedLiquidationService {
         userHealth.user,
         bestPair.collateral,
         bestPair.debt,
-        userHealth.healthFactor,
         priceCache
       );
-      if (params && params.estimatedValue >= 100) {
+      if (params && params.estimatedValue >= this.MIN_LIQUIDATION_VALUE_USD) {
         resultMap.set(userHealth.user, { params, userHealth });
       }
     }

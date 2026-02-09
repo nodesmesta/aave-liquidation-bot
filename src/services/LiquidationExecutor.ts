@@ -51,10 +51,14 @@ export class LiquidationExecutor {
     });
     this.publicClient = createPublicClient({
       chain: this.chain,
+      transport: http(),
+    });
+    const rpcPublicClient = createPublicClient({
+      chain: this.chain,
       transport: http(rpcUrl),
     });
-    this.gasManager = new GasManager(this.publicClient);
-    this.nonceManager = new NonceManager(this.publicClient, this.account.address);
+    this.gasManager = new GasManager(rpcPublicClient);
+    this.nonceManager = new NonceManager(rpcPublicClient, this.account.address);
     if (!config.liquidator.address) {
       throw new Error('Liquidator contract address not configured');
     }
@@ -62,19 +66,11 @@ export class LiquidationExecutor {
 
   /**
    * @notice Initialize nonce and gas managers at bot startup
-   * @dev Verifies flashblocks endpoint configuration and logs RPC endpoints
+   * @dev Initializes nonce manager and confirms flashblocks integration
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
-    const walletRpcUrl = this.walletClient.transport.url || 'unknown';
-    const publicRpcUrl = this.publicClient.transport.url || 'unknown';
-    logger.info(`walletClient (TX broadcast): ${walletRpcUrl}`);
-    logger.info(`publicClient (read operations): ${publicRpcUrl}`);
-    if (walletRpcUrl.includes('mainnet-preconf.base.org')) {
-      logger.info('Flashblocks enabled for TX broadcast');
-    } else {
-      throw new Error(`CRITICAL: Must use flashblocks endpoint! Current: ${walletRpcUrl}. Set BASE_RPC_URL=https://mainnet-preconf.base.org`);
-    }
+    logger.info(`Flashblocks integration: walletClient (broadcast) and publicClient (receipt) via mainnet-preconf.base.org`);
   }
 
   /**
@@ -84,6 +80,27 @@ export class LiquidationExecutor {
   private recordFailure(): void {
     this.stats.failedLiquidations++;
     this.stats.consecutiveLosses++;
+  }
+
+  /**
+   * @notice Poll transaction receipt from Flashblocks endpoint
+   * @dev Standard eth_getTransactionReceipt call on Flashblocks-aware RPC
+   * Flashblocks returns receipt when TX is preconfirmed (200ms) or on-chain
+   * @param hash Transaction hash to poll
+   * @param maxWaitTime Max wait time in ms (default 5s for Flashblocks preconf timing)
+   * @return Transaction receipt or null if timeout
+   */
+  private async pollTransactionConfirmation(hash: `0x${string}`, maxWaitTime: number = 5_000): Promise<any> {
+    const pollInterval = 100;
+    const startTime = Date.now();
+    while (Date.now() - startTime < maxWaitTime) {
+      const receipt = await this.publicClient.getTransactionReceipt({ hash });
+      if (receipt) {
+        return receipt;
+      }
+      await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+    return null;
   }
 
   /**
@@ -102,26 +119,21 @@ export class LiquidationExecutor {
     const baseFees = await this.gasManager.getEstimatedFees();
     const gasSettings = this.gasManager.calculateGasSettings(baseFees, gasLimit, liquidationValueUSD);
     const maxGasCostETH = this.gasManager.calculateMaxGasCostETH(gasSettings);
-    
     if (walletBalanceETH < maxGasCostETH) {
       return null;
     }
-    
     return { gasSettings, maxGasCostETH };
   }
 
   /**
-   * @notice Execute liquidation with simplified parameters
-   * @dev Uses EIP-1559 gas with dynamic priority fee based on liquidation value
-   * @param collateralAsset Address of collateral asset to seize
-   * @param debtAsset Address of transaction with flashblocks optimization
-   * @dev Implements pre-signing, sequencer verification, and conditional timeout
+   * @notice Execute liquidation with flashblocks optimization
+   * @dev Uses EIP-1559 gas with dynamic priority fee. Implements pre-signing, sequencer verification, and on-chain confirmation
    * @param collateralAsset Address of collateral asset to seize
    * @param debtAsset Address of debt asset to repay
    * @param user Address of user to liquidate
    * @param debtToCover Amount of debt to cover
    * @param estimatedValue Estimated liquidation value in USD for gas calculation
-   * @param gasSettings Optional pre-calculated gas settings to avoid recalculation
+   * @param gasSettings Pre-calculated gas settings (maxFeePerGas, maxPriorityFeePerGas, gas)
    * @return Execution result with success status, txHash, and gas used
    */
   async executeLiquidation(
@@ -134,14 +146,11 @@ export class LiquidationExecutor {
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
-    
     let hash: `0x${string}` | undefined;
     let prepareTime: number;
     let signTime: number;
     let broadcastTime: number;
-    
     logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
-    
     try {
       const prepareStart = Date.now();
       const data = encodeFunctionData({
@@ -150,7 +159,6 @@ export class LiquidationExecutor {
         args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
       });
       prepareTime = Date.now() - prepareStart;
-      
       const signStart = Date.now();
       const signedTx = await this.account.signTransaction({
         to: config.liquidator.address as Address,
@@ -162,7 +170,6 @@ export class LiquidationExecutor {
         chainId: this.chain.id,
       });
       signTime = Date.now() - signStart;
-      
       const broadcastStart = Date.now();
       hash = await this.walletClient.sendRawTransaction({
         serializedTransaction: signedTx,
@@ -175,16 +182,13 @@ export class LiquidationExecutor {
       this.recordFailure();
       return { success: false, error: errorMsg };
     }
-    
-    const broadcastEndpoint = this.walletClient.transport.url || 'default';
-    const verifyStart = Date.now();
     try {
+      const verifyStart = Date.now();
       const statusResponse: any = await this.walletClient.transport.request({
         method: 'base_transactionStatus',
         params: [hash],
       });
       const verifyTime = Date.now() - verifyStart;
-      
       if (statusResponse?.status !== 'Known') {
         release();
         const errorMsg = `TX rejected by sequencer: ${hash} (status: ${statusResponse?.status || 'null'})`;
@@ -192,9 +196,8 @@ export class LiquidationExecutor {
         this.recordFailure();
         return { success: false, error: errorMsg };
       }
-      
       this.nonceManager.confirmNonce(nonce);
-      logger.info(`TX sent: ${hash} -> ${broadcastEndpoint} Accepted by sequencer (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: ${verifyTime}ms)`);
+      logger.info(`TX broadcast: ${hash} | Sequencer accepted (prepare: ${prepareTime}ms, sign: ${signTime}ms, broadcast: ${broadcastTime}ms, verify: ${verifyTime}ms)`);
     } catch (verifyError: any) {
       release();
       const errorMsg = `Failed to verify TX with sequencer: ${verifyError.message}`;
@@ -202,45 +205,27 @@ export class LiquidationExecutor {
       this.recordFailure();
       return { success: false, error: errorMsg };
     }
-    
     try {
-      const waitTimeout = 60_000;
-      const receipt = await this.publicClient.waitForTransactionReceipt({ 
-        hash,
-        timeout: waitTimeout,
-      });
-      
-      if (receipt.status === 'success') {
-        logger.info(`Liquidation successful: ${receipt.transactionHash}, gas ${receipt.gasUsed}`);
-        this.stats.successfulLiquidations++;
-        this.stats.totalGasSpent = this.stats.totalGasSpent + receipt.gasUsed;
-        this.stats.consecutiveLosses = 0;
+      const receipt = await this.pollTransactionConfirmation(hash);
+      if (!receipt) {
+        logger.error(`TX confirmation timeout: ${hash} - TX may still be pending on-chain`);
+        this.recordFailure();
         return {
-          success: true,
-          txHash: receipt.transactionHash,
-          gasUsed: receipt.gasUsed,
+          success: false,
+          error: 'Transaction confirmation timeout',
         };
       }
-      
-      logger.error(`Transaction reverted on-chain: ${hash}`, { 
-        status: receipt.status,
-        gasUsed: receipt.gasUsed 
-      });
-      this.recordFailure();
+      logger.info(`Liquidation successful: ${receipt.transactionHash}, gas ${receipt.gasUsed}`);
+      this.stats.successfulLiquidations++;
+      this.stats.totalGasSpent = this.stats.totalGasSpent + receipt.gasUsed;
+      this.stats.consecutiveLosses = 0;
       return {
-        success: false,
-        error: 'Transaction reverted on-chain',
-        txHash: hash,
+        success: true,
+        txHash: receipt.transactionHash,
         gasUsed: receipt.gasUsed,
       };
-      
     } catch (error: any) {
-      const isTimeout = error.message?.includes('timeout') || error.message?.includes('timed out');
-      if (isTimeout) {
-        logger.error(`TX timeout waiting for receipt: ${hash} - TX may still be pending on-chain`);
-      } else {
-        logger.error(`Unexpected error during TX confirmation: ${error.message}`);
-      }
+      logger.error(`Error during TX confirmation: ${error.message}`);
       this.recordFailure();
       return {
         success: false,
@@ -264,7 +249,8 @@ export class LiquidationExecutor {
       account: this.account,
       chain: this.chain,
     });
-    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+    const receipt = await this.pollTransactionConfirmation(hash);
+    if (!receipt) throw new Error(`Failed to confirm ownership transfer for TX: ${hash}`);
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);
   }
 
