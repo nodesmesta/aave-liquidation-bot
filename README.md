@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>Automated liquidation bot for Aave V3 on Base Network</strong>
+  <strong>liquidation bot for Aave V3 on Base Network</strong>
 </p>
 
 ---
