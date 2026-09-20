@@ -8,6 +8,7 @@ export const config = {
     rpcUrl: process.env.BASE_RPC_URL || '',
     wssUrl: process.env.BASE_WSS_URL || '',
     wssUrlFallback: process.env.BASE_WSS_URL_FALLBACK || '',
+    preconfUrl: process.env.PRECONFIRMATION_RPC_URL || '',
   },
 
   // Wallet
@@ -23,12 +24,12 @@ export const config = {
     oracle: AaveV3Base.ORACLE,
     protocolDataProvider: AaveV3Base.AAVE_PROTOCOL_DATA_PROVIDER,
     uiPoolDataProvider: AaveV3Base.UI_POOL_DATA_PROVIDER,
-    subgraphUrl: process.env.AAVE_SUBGRAPH_URL || '',
+    subgraphUrl: process.env.AAVE_SUBGRAPH_URL || process.env.AAVE_SUBGRAPH_URL_BASE || '',
   },
 
   // Liquidator Contract
   liquidator: {
-    address: process.env.LIQUIDATOR_CONTRACT_ADDRESS || '',
+    address: process.env.LIQUIDATOR_CONTRACT_ADDRESS || process.env.LIQUIDATOR_CONTRACT_ADDRESS_BASE || '',
   },
 
   // Logging
@@ -67,6 +68,10 @@ export function validateConfig(): void {
   
   if (!config.network.rpcUrl) {
     throw new Error('BASE_RPC_URL not set in environment');
+  }
+
+  if (!config.network.preconfUrl) {
+    throw new Error('PRECONFIRMATION_RPC_URL not set in environment');
   }
   
   if (!config.aave.subgraphUrl) {

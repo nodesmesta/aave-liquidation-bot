@@ -1,6 +1,5 @@
 import { GraphQLClient, gql } from 'graphql-request';
-import { createPublicClient, http, parseAbi, Address } from 'viem';
-import { base } from 'viem/chains';
+import { parseAbi, Address } from 'viem';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 
@@ -38,7 +37,10 @@ export class SubgraphService {
     'EURC'
   ]);
 
-  constructor(subgraphUrl: string, apiKey?: string) {
+  private publicClient: any;
+
+  constructor(subgraphUrl: string, publicClient: any, apiKey?: string) {
+    this.publicClient = publicClient;
     const key = apiKey || process.env.SUBGRAPH_API_KEY || '';
     this.client = new GraphQLClient(subgraphUrl, {
       headers: {
@@ -162,15 +164,11 @@ export class SubgraphService {
    */
   async validateUsersOnChain(
     userAddresses: string[],
-    rpcUrl: string,
     poolAddress: string,
     protocolDataProvider: string
   ): Promise<Map<string, { hf: number; collateral: number; debt: number; collateralAssets: string[]; debtAssets: string[] }>> {
     logger.info(`Validating ${userAddresses.length} users on-chain via viem multicall...`);
-    const client = createPublicClient({
-      chain: base,
-      transport: http(rpcUrl),
-    });
+    const client = this.publicClient;
     const poolAbi = parseAbi([
       'function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
       'function getUserConfiguration(address user) external view returns ((uint256 data))',

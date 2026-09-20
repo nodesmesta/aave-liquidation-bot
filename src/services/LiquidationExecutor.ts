@@ -1,4 +1,4 @@
-import { createPublicClient, createWalletClient as viemCreateWalletClient, http, parseAbi, Address, Chain, encodeFunctionData } from 'viem';
+import { createWalletClient as viemCreateWalletClient, http, parseAbi, Address, Chain, encodeFunctionData } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -41,24 +41,17 @@ export class LiquidationExecutor {
     consecutiveLosses: 0,
   };
 
-  constructor(rpcUrl: string, account?: ReturnType<typeof createAccount>) {
+  constructor(rpcClient: any, preconfClient: any, account?: ReturnType<typeof createAccount>) {
     this.account = account || createAccount();
     this.chain = basePreconf;
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
-      transport: http(),
+      transport: http(config.network.rpcUrl),
     });
-    this.publicClient = createPublicClient({
-      chain: this.chain,
-      transport: http(),
-    });
-    const rpcPublicClient = createPublicClient({
-      chain: this.chain,
-      transport: http(rpcUrl),
-    });
-    this.gasManager = new GasManager(rpcPublicClient);
-    this.nonceManager = new NonceManager(rpcPublicClient, this.account.address);
+    this.publicClient = preconfClient;
+    this.gasManager = new GasManager(rpcClient);
+    this.nonceManager = new NonceManager(rpcClient, this.account.address);
     if (!config.liquidator.address) {
       throw new Error('Liquidator contract address not configured');
     }
@@ -184,7 +177,7 @@ export class LiquidationExecutor {
     }
     try {
       const verifyStart = Date.now();
-      const statusResponse: any = await this.walletClient.transport.request({
+      const statusResponse: any = await this.publicClient.transport.request({
         method: 'base_transactionStatus',
         params: [hash],
       });

@@ -51,3 +51,12 @@ out/
 # Temp
 tmp/
 temp/
+
+# Claude
+.claude/
+
+# Tasks
+task/
+
+# VM Environment
+vm-setup/

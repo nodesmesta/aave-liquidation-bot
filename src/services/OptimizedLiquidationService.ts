@@ -1,5 +1,4 @@
-import { createPublicClient, http, parseAbi, Address, formatUnits } from 'viem';
-import { base } from 'viem/chains';
+import { parseAbi, Address, formatUnits } from 'viem';
 import { logger } from '../utils/logger';
 import { UserHealth } from './HealthChecker';
 import { PriceOracle } from './PriceOracle';
@@ -68,13 +67,10 @@ export class OptimizedLiquidationService {
   private reservesCache: Array<{ symbol: string; address: string }> | null = null;
   private reserveConfigCache: Map<string, { decimals: number; liquidationBonus: number }> = new Map();
 
-  constructor(rpcUrl: string, protocolDataProvider: string) {
+  constructor(publicClient: any, protocolDataProvider: string) {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
-    this.publicClient = createPublicClient({
-      chain: base,
-      transport: http(rpcUrl),
-    });
+    this.publicClient = publicClient;
     this.priceOracle = new PriceOracle(this.publicClient);
   }
 

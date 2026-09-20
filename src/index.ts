@@ -13,9 +13,11 @@ import { OptimizedLiquidationService } from './services/OptimizedLiquidationServ
 import { UserPool } from './services/UserPool';
 import { SupportedAsset } from './config/assets';
 import { LiquidationParams } from './services/OptimizedLiquidationService';
+import { LiquidationManager } from './services/LiquidationManager';
 
 class LiquidatorBot {
-  private publicClient: any;
+  private globalRpcClient: any;
+  private globalPreconfClient: any;
   private account: ReturnType<typeof createAccount>;
   private healthChecker: HealthChecker;
   private executor: LiquidationExecutor;
@@ -25,10 +27,8 @@ class LiquidatorBot {
   private userPool: UserPool;
   private isInitialized = false;
   private isPriceMonitoring = false;
-  private isCheckingUsers = false;
   private isRestarting = false;
-  private inFlightLiquidations: Set<string> = new Set();
-  private priceUpdateTimestamp: number = 0;
+  private liquidationManager: LiquidationManager;
 
   constructor() {
     const customChain: Chain = {
@@ -38,23 +38,37 @@ class LiquidatorBot {
         default: { http: [config.network.rpcUrl] },
       },
     } as Chain;
-    this.publicClient = createPublicClient({
+    this.globalRpcClient = createPublicClient({
       chain: customChain,
       transport: http(config.network.rpcUrl),
     });
+    this.globalPreconfClient = createPublicClient({
+      chain: basePreconf,
+      transport: http(config.network.preconfUrl),
+    });
     this.account = createAccount();
-    this.healthChecker = new HealthChecker(config.network.rpcUrl, config.aave.pool);
+    this.healthChecker = new HealthChecker(this.globalRpcClient, config.aave.pool);
     this.executor = new LiquidationExecutor(
-      config.network.rpcUrl,
+      this.globalRpcClient,
+      this.globalPreconfClient,
       this.account
     );
-    this.priceOracle = new PriceOracle(this.publicClient);
-    this.subgraphService = new SubgraphService(config.aave.subgraphUrl);
+    this.priceOracle = new PriceOracle(this.globalRpcClient);
+    this.subgraphService = new SubgraphService(config.aave.subgraphUrl, this.globalRpcClient);
     this.optimizedLiquidation = new OptimizedLiquidationService(
-      config.network.rpcUrl,
+      this.globalRpcClient,
       config.aave.protocolDataProvider
     );
     this.userPool = new UserPool();
+    this.liquidationManager = new LiquidationManager(
+      this.userPool,
+      this.healthChecker,
+      this.optimizedLiquidation,
+      this.executor,
+      this.globalRpcClient,
+      this.account.address,
+      async () => { await this.restart(); }
+    );
   }
 
   /**
@@ -75,7 +89,6 @@ class LiquidatorBot {
       const userAddresses = Array.from(candidatesMap.keys());
       const validationResults = await this.subgraphService.validateUsersOnChain(
         userAddresses,
-        config.network.rpcUrl,
         config.aave.pool,
         config.aave.protocolDataProvider
       );
@@ -135,8 +148,6 @@ class LiquidatorBot {
     logger.info('Stopping Liquidator Bot...');
     this.isPriceMonitoring = false;
     this.isInitialized = false;
-    this.inFlightLiquidations.clear();
-    this.isCheckingUsers = false;
     this.priceOracle.stopPriceMonitoring();
     logger.info('Final Statistics:', this.executor.getStats());
     logger.info('Bot stopped');
@@ -194,9 +205,9 @@ class LiquidatorBot {
    * @dev Checks network ID matches config, logs block number and wallet balance
    */
   private async checkConnection(): Promise<void> {
-    const chainId = await this.publicClient.getChainId();
-    const blockNumber = await this.publicClient.getBlockNumber();
-    const balance = await this.publicClient.getBalance({ address: this.account.address });
+    const chainId = await this.globalRpcClient.getChainId();
+    const blockNumber = await this.globalRpcClient.getBlockNumber();
+    const balance = await this.globalRpcClient.getBalance({ address: this.account.address });
     logger.info(`Connected: Base chain ${chainId}, block ${blockNumber}, balance ${formatEther(balance)} ETH`);
     if (Number(chainId) !== basePreconf.id) {
       throw new Error(`Wrong network! Expected ${basePreconf.id}, got ${chainId}`);
@@ -227,138 +238,16 @@ class LiquidatorBot {
     });
     await this.priceOracle.startPriceMonitoring(
       assetsToMonitor,
-      this.handlePriceChange.bind(this),
+      async (updates) => {
+        if (!this.isInitialized || this.isRestarting) return;
+        await this.liquidationManager.handlePriceChange(updates);
+      },
       config.network.wssUrl
     );
     this.isPriceMonitoring = true;
   }
 
-  /**
-   * @notice Handle Chainlink price update events
-   * @dev Optimized: Check high-risk users (HF <= 1.03) first, then update cache for all affected
-   * @param updates Array of price updates from Chainlink
-   */
-  private async handlePriceChange(updates: PriceUpdate[]): Promise<void> {
-    if (updates.length === 0) return;
-    if (!this.isInitialized || this.isRestarting) return;
-    this.priceUpdateTimestamp = Date.now();
-    const highRiskUsers = new Set<string>();
-    const allAffectedUsers = new Set<string>();
-    for (const update of updates) {
-      const assetSymbol = getAssetSymbol(update.asset);
-      const usersWithCollateral = this.userPool.getUsersWithCollateral(assetSymbol);
-      const usersWithDebt = this.userPool.getUsersWithDebt(assetSymbol);
-      const highRiskCollateral = usersWithCollateral.filter(u => u.lastCheckedHF <= 1.03);
-      const highRiskDebt = usersWithDebt.filter(u => u.lastCheckedHF <= 1.03);
-      highRiskCollateral.forEach(user => highRiskUsers.add(user.address));
-      highRiskDebt.forEach(user => highRiskUsers.add(user.address));
-      usersWithCollateral.forEach(user => allAffectedUsers.add(user.address));
-      usersWithDebt.forEach(user => allAffectedUsers.add(user.address));
-      const totalAffected = allAffectedUsers.size;
-      const highRiskCount = highRiskUsers.size;
-      if (totalAffected > 0) {
-        const direction = update.percentChange > 0 ? '↑' : '↓';
-        logger.info(`${assetSymbol} ${direction}${Math.abs(update.percentChange).toFixed(2)}% ($${update.oldPrice.toFixed(2)}→$${update.newPrice.toFixed(2)}) affects ${totalAffected} users (${highRiskCount} high-risk)`);
-      }
-    }
-    if (!this.isCheckingUsers && highRiskUsers.size > 0) {
-      this.checkHighRiskThenUpdateCache(Array.from(highRiskUsers), Array.from(allAffectedUsers));
-    }
-  }
 
-  /**
-   * @notice Check high-risk users first, execute if liquidatable, otherwise update cache for all affected
-   * @dev Two-phase strategy: fast path for liquidation, slow path for cache updates
-   * @param highRiskUsers Users with HF <= 1.03 to check first
-   * @param allAffectedUsers All users affected by price change for cache update
-   */
-  private async checkHighRiskThenUpdateCache(highRiskUsers: string[], allAffectedUsers: string[]): Promise<void> {
-    if (this.isCheckingUsers) return;
-    if (!this.isInitialized || this.isRestarting) return;
-    this.isCheckingUsers = true;
-    try {
-      const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
-      logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (elapsed: ${elapsedSincePriceUpdate}ms)`);
-      const highRiskCheckStart = Date.now();
-      const highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
-      const highRiskCheckLatency = Date.now() - highRiskCheckStart;
-      const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
-      if (liquidatable.length > 0) {
-        logger.info(`Found ${liquidatable.length} liquidatable (check: ${highRiskCheckLatency}ms)`);
-        const availableUsers = liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
-        if (availableUsers.length > 0) {
-          const selection = await this.selectBestLiquidation(availableUsers);
-          if (selection) {
-            const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
-            if (success) await this.restart();
-            return;
-          }
-        }
-      }
-      logger.info(`Phase 2: No liquidatable positions found, updating cache for ${allAffectedUsers.length} affected users`);
-      const cacheUpdateStart = Date.now();
-      const allHealthMap = await this.healthChecker.checkUsers(allAffectedUsers);
-      const cacheUpdateLatency = Date.now() - cacheUpdateStart;
-      let removedCount = 0;
-      for (const [address, health] of allHealthMap.entries()) {
-        if (health.healthFactor >= 1.1) {
-          this.userPool.removeUser(address);
-          removedCount++;
-        } else {
-          this.userPool.updateUserHF(address, health.healthFactor);
-        }
-      }
-      logger.info(`Cache updated (${removedCount} removed, ${cacheUpdateLatency}ms)`);
-    } catch (error) {
-      logger.error('Error in two-phase health check:', error);
-    } finally {
-      this.isCheckingUsers = false;
-    }
-  }
-
-  private async selectBestLiquidation(
-    users: UserHealth[]
-  ): Promise<{ user: UserHealth; params: LiquidationParams; gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint } } | null> {
-    const paramsStart = Date.now();
-    const paramsMap = await this.optimizedLiquidation.getLiquidationParamsForMultipleUsers(users);
-    const paramsLatency = Date.now() - paramsStart;
-    if (paramsMap.size === 0) {
-      logger.warn('No valid liquidations found (all users failed validation or value < $100)');
-      return null;
-    }
-    
-    const validLiquidations = Array.from(paramsMap.values());
-    validLiquidations.sort((a, b) => {
-      const valueDiff = b.params.estimatedValue - a.params.estimatedValue;
-      if (Math.abs(valueDiff) > 50) return valueDiff;
-      return a.userHealth.healthFactor - b.userHealth.healthFactor;
-    });
-    
-    const balance = await this.publicClient.getBalance({ address: this.account.address });
-    const balanceETH = Number(formatEther(balance));
-    const fixedGasLimit = 920000n;
-    let skippedCount = 0;
-    
-    for (const liq of validLiquidations) {
-      const gasResult = await this.executor.calculateAffordableGasSettings(
-        fixedGasLimit,
-        liq.params.estimatedValue,
-        balanceETH
-      );
-      
-      if (gasResult) {
-        const skip = skippedCount > 0 ? ` (skipped ${skippedCount})` : '';
-        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH (${paramsLatency}ms)`);
-        return { user: liq.userHealth, params: liq.params, gasSettings: gasResult.gasSettings };
-      } else {
-        skippedCount++;
-        logger.debug(`Skip #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} ($${liq.params.estimatedValue.toFixed(0)}): insufficient balance`);
-      }
-    }
-    
-    logger.warn(`No affordable liquidations: balance ${balanceETH.toFixed(6)}ETH insufficient for ${validLiquidations.length} opportunities`);
-    return null;
-  }
 
   /**
    * @notice Export UserPool snapshot to JSON file for monitoring (async, non-blocking)
@@ -388,31 +277,7 @@ class LiquidatorBot {
     logger.debug(`Snapshoot createdt: ${users.length} users`);
   }
 
-  private async executeLiquidationWithParams(
-    userHealth: UserHealth,
-    params: LiquidationParams,
-    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
-  ): Promise<boolean> {
-    this.inFlightLiquidations.add(userHealth.user);
-    try {
-      const tx = await this.executor.executeLiquidation(
-        params.collateralAsset,
-        params.debtAsset,
-        params.userAddress,
-        params.debtToCover,
-        params.estimatedValue,
-        gasSettings
-      );
-      const totalLatency = Date.now() - this.priceUpdateTimestamp;
-      if (tx.success) {
-        logger.info(`✓ Liquidated ${tx.txHash} (price→tx: ${totalLatency}ms)`);
-        return true;
-      }
-      return false;
-    } finally {
-      this.inFlightLiquidations.delete(userHealth.user);
-    }
-  }
+
 }
 
 async function main() {

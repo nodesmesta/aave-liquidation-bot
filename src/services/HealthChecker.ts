@@ -1,5 +1,4 @@
-import { createPublicClient, http, parseAbi, Address } from 'viem';
-import { base } from 'viem/chains';
+import { parseAbi, Address } from 'viem';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -21,13 +20,9 @@ export class HealthChecker {
     'function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
   ]);
 
-  constructor(rpcUrl?: string, poolAddress?: string) {
-    const resolvedRpcUrl = rpcUrl || config.network.rpcUrl;
+  constructor(publicClient: any, poolAddress?: string) {
     this.poolAddress = poolAddress || config.aave.pool;
-    this.publicClient = createPublicClient({
-      chain: base,
-      transport: http(resolvedRpcUrl),
-    });
+    this.publicClient = publicClient;
   }
 
   /**
