@@ -46,20 +46,6 @@ export const config = {
   },
 };
 
-// Asset configuration is now centralized in ./assets.ts
-import { SupportedAsset } from './assets';
-
-// Helper function to get asset symbol from address
-export function getAssetSymbol(address: string): string {
-  const normalizedAddress = address.toLowerCase();
-  for (const [symbol, config] of Object.entries(SupportedAsset)) {
-    if (config.address.toLowerCase() === normalizedAddress) {
-      return symbol;
-    }
-  }
-  return address;
-}
-
 // Validation
 export function validateConfig(): void {
   if (!config.wallet.privateKey && !config.wallet.mnemonic) {

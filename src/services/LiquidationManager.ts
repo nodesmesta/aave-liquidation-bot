@@ -5,7 +5,9 @@ import { LiquidationExecutor } from './LiquidationExecutor';
 import { PriceUpdate } from './PriceOracle';
 import { OptimizedLiquidationService, LiquidationParams } from './OptimizedLiquidationService';
 import { UserPool } from './UserPool';
-import { getAssetSymbol } from '../config';
+
+
+import { AssetManager } from './AssetManager';
 
 export class LiquidationManager {
   private isCheckingUsers = false;
@@ -19,6 +21,7 @@ export class LiquidationManager {
     private executor: LiquidationExecutor,
     private globalRpcClient: any,
     private accountAddress: string,
+    private assetManager: AssetManager,
     private onLiquidationSuccess: () => Promise<void>
   ) {}
 
@@ -33,7 +36,7 @@ export class LiquidationManager {
     const highRiskUsers = new Set<string>();
     const allAffectedUsers = new Set<string>();
     for (const update of updates) {
-      const assetSymbol = getAssetSymbol(update.asset);
+      const assetSymbol = this.assetManager.getSymbol(update.asset);
       const usersWithCollateral = this.userPool.getUsersWithCollateral(assetSymbol);
       const usersWithDebt = this.userPool.getUsersWithDebt(assetSymbol);
       const highRiskCollateral = usersWithCollateral.filter(u => u.lastCheckedHF <= 1.03);

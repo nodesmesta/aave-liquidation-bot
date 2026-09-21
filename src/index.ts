@@ -1,6 +1,6 @@
 import { createPublicClient, http, formatEther, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
-import { config, validateConfig, getAssetSymbol } from './config';
+import { config, validateConfig } from './config';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from './utils/logger';
@@ -11,7 +11,7 @@ import { PriceOracle, PriceUpdate } from './services/PriceOracle';
 import { SubgraphService } from './services/SubgraphService';
 import { OptimizedLiquidationService } from './services/OptimizedLiquidationService';
 import { UserPool } from './services/UserPool';
-import { SupportedAsset } from './config/assets';
+import { AssetManager } from './services/AssetManager';
 import { LiquidationParams } from './services/OptimizedLiquidationService';
 import { LiquidationManager } from './services/LiquidationManager';
 
@@ -23,6 +23,7 @@ class LiquidatorBot {
   private executor: LiquidationExecutor;
   private priceOracle: PriceOracle;
   private subgraphService: SubgraphService;
+  private assetManager: AssetManager;
   private optimizedLiquidation: OptimizedLiquidationService;
   private userPool: UserPool;
   private isInitialized = false;
@@ -55,9 +56,14 @@ class LiquidatorBot {
     );
     this.priceOracle = new PriceOracle(this.globalRpcClient);
     this.subgraphService = new SubgraphService(config.aave.subgraphUrl, this.globalRpcClient);
-    this.optimizedLiquidation = new OptimizedLiquidationService(
+    this.assetManager = new AssetManager(
       this.globalRpcClient,
       config.aave.protocolDataProvider
+    );
+    this.optimizedLiquidation = new OptimizedLiquidationService(
+      this.globalRpcClient,
+      config.aave.protocolDataProvider,
+      this.assetManager
     );
     this.userPool = new UserPool();
     this.liquidationManager = new LiquidationManager(
@@ -67,6 +73,7 @@ class LiquidatorBot {
       this.executor,
       this.globalRpcClient,
       this.account.address,
+      this.assetManager,
       async () => { await this.restart(); }
     );
   }
@@ -79,7 +86,8 @@ class LiquidatorBot {
     try {
       logger.info('Initializing bot (strategy: USDC debt, HF < 1.075)...');
       await this.executor.initialize();
-      await this.optimizedLiquidation.warmupConfigCache();
+      await this.assetManager.initialize();
+      this.assetManager.startEventListening();
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No candidates found from subgraph');
@@ -99,14 +107,14 @@ class LiquidatorBot {
       }
       logger.info(`Loaded ${validationResults.size} users (${candidatesMap.size} scanned)`);
       for (const [address, data] of validationResults.entries()) {
-        const collateralSymbols = data.collateralAssets.map((addr: string) => getAssetSymbol(addr) || addr);
+        const collateralSymbols = data.collateralAssets.map((addr: string) => this.assetManager.getSymbol(addr) || addr);
         this.userPool.addUser({
           address: address,
           estimatedHF: data.hf,
           collateralUSD: data.collateral,
           debtUSD: data.debt,
           collateralAssets: collateralSymbols,
-          debtAssets: data.debtAssets.map((addr: string) => getAssetSymbol(addr) || addr),
+          debtAssets: data.debtAssets.map((addr: string) => this.assetManager.getSymbol(addr) || addr),
           lastCheckedHF: data.hf,
           lastUpdated: Date.now(),
           addedAt: Date.now()
@@ -183,22 +191,6 @@ class LiquidatorBot {
     process.exit(1);
   }
 
-  /**
-   * @notice Convert asset symbols to addresses for price monitoring
-   * @dev Only returns addresses with Chainlink oracles (monitorPrice: true), filters stablecoins
-   * @param symbols Array of asset symbols
-   * @return Array of asset addresses to monitor
-   */
-  private getAssetAddressesFromSymbols(symbols: string[]): string[] {
-    const addresses: string[] = [];
-    for (const symbol of symbols) {
-      const asset = SupportedAsset[symbol];
-      if (asset && asset.monitorPrice) {
-        addresses.push(asset.address);
-      }
-    }
-    return addresses;
-  }
 
   /**
    * @notice Verify RPC connection and network
@@ -220,18 +212,13 @@ class LiquidatorBot {
    */
   private async ensurePriceMonitoring(): Promise<void> {
     if (this.isPriceMonitoring) return;
-    const uniqueCollateralSymbols = this.userPool.getUniqueCollateralAssets();
-    const uniqueDebtSymbols = this.userPool.getUniqueDebtAssets();
-    const allAssetSymbols = [...new Set([...uniqueCollateralSymbols, ...uniqueDebtSymbols])];
-    const assetsToMonitor = this.getAssetAddressesFromSymbols(allAssetSymbols);
+    // TODO (Task 2.2): Gunakan this.assetManager.getAddressesToMonitor()
+    const assetsToMonitor: string[] = []; 
     if (assetsToMonitor.length === 0) {
-      logger.warn('No volatile assets to monitor (UserPool empty or only stablecoins)');
+      logger.warn('No volatile assets to monitor (AssetManager not initialized yet)');
       return;
     }
-    const monitoredSymbols = assetsToMonitor
-      .map(addr => getAssetSymbol(addr))
-      .filter(symbol => SupportedAsset[symbol]?.monitorPrice);
-    logger.info(`Monitoring ${assetsToMonitor.length} assets: ${monitoredSymbols.join(', ')}`);
+    logger.info(`Monitoring ${assetsToMonitor.length} assets`);
     this.priceOracle.setFatalErrorHandler(() => {
       logger.error('Fatal WebSocket error detected, initiating bot restart...');
       this.restartBot();

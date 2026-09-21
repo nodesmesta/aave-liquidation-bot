@@ -4,6 +4,7 @@ import { UserHealth } from './HealthChecker';
 import { PriceOracle } from './PriceOracle';
 import { config } from '../config';
 
+import { AssetManager } from './AssetManager';
 export interface UserReserveData {
   asset: string;
   symbol: string;
@@ -64,14 +65,15 @@ export class OptimizedLiquidationService {
     }
   ] as const;
 
-  private reservesCache: Array<{ symbol: string; address: string }> | null = null;
-  private reserveConfigCache: Map<string, { decimals: number; liquidationBonus: number }> = new Map();
 
-  constructor(publicClient: any, protocolDataProvider: string) {
+  private assetManager: AssetManager;
+
+  constructor(publicClient: any, protocolDataProvider: string, assetManager: AssetManager) {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
     this.publicClient = publicClient;
     this.priceOracle = new PriceOracle(this.publicClient);
+    this.assetManager = assetManager;
   }
 
   /**
@@ -91,59 +93,7 @@ export class OptimizedLiquidationService {
     return allActiveIds;
   }
 
-  /**
-   * @notice Get all reserves from Aave Protocol Data Provider
-   * @dev Results are cached after first fetch
-   * @return Array of reserve symbols and addresses
-   */
-  private async getAllReserves(): Promise<Array<{ symbol: string; address: string }>> {
-    if (this.reservesCache) {
-      return this.reservesCache;
-    }
-    const result = await this.publicClient.readContract({
-      address: this.protocolDataProvider as Address,
-      abi: this.reservesTokensAbi,
-      functionName: 'getAllReservesTokens',
-    }) as Array<{ symbol: string; tokenAddress: string }>;
-    this.reservesCache = result.map(r => ({
-      symbol: r.symbol,
-      address: r.tokenAddress,
-    }));
-    logger.debug(`Cached ${this.reservesCache.length} reserves`);
-    return this.reservesCache;
-  }
 
-  /**
-   * @notice Warmup reserve config cache by pre-fetching all reserves
-   * @dev Called during bot initialization, cache refreshed on bot restart
-   */
-  async warmupConfigCache(): Promise<void> {
-    const allReserves = await this.getAllReserves();
-    const allAssetAddresses = allReserves.map(r => r.address);
-    
-    const configContracts = allAssetAddresses.map(asset => ({
-      address: this.protocolDataProvider as Address,
-      abi: this.dataProviderAbi,
-      functionName: 'getReserveConfigurationData',
-      args: [asset as Address],
-    }));
-    
-    const results = await this.publicClient.multicall({ contracts: configContracts });
-    
-    for (let i = 0; i < allAssetAddresses.length; i++) {
-      const result = results[i];
-      if (result.status === 'success') {
-        const configData = result.result as any[];
-        const decimals = Number(configData[0]);
-        const liquidationBonusRaw = Number(configData[3]);
-        const liquidationBonus = (liquidationBonusRaw - 10000) / 100;
-        
-        this.reserveConfigCache.set(allAssetAddresses[i], { decimals, liquidationBonus });
-      }
-    }
-    
-    logger.info(`Reserve config cache warmed up: ${this.reserveConfigCache.size} assets cached`);
-  }
 
   selectBestPair(
     userReserves: UserReserveData[],
@@ -288,7 +238,7 @@ export class OptimizedLiquidationService {
   ): Promise<Map<string, { params: LiquidationParams; userHealth: UserHealth }>> {
     if (users.length === 0) return new Map();
     const startTime = Date.now();
-    const allReserves = await this.getAllReserves();
+    const allReserves = this.assetManager.getAllReserves();
     const bitmapContracts = users.map(user => ({
       address: this.poolAddress as Address,
       abi: this.poolAbi,
@@ -369,7 +319,7 @@ export class OptimizedLiquidationService {
         const usageAsCollateralEnabled = userData[8] as boolean;
         if (collateralBalance === 0n && debtBalance === 0n) continue;
         const reserve = allReserves[reserveId];
-        const config = this.reserveConfigCache.get(reserve.address);
+        const config = this.assetManager.getAssetConfig(reserve.address);
         if (!config) {
           logger.warn(`Config not found for ${reserve.symbol}, skipping`);
           continue;
