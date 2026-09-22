@@ -128,18 +128,19 @@ export class SubgraphService {
 
         for (const reserve of user.reserves) {
           const priceInEth = parseFloat(reserve.reserve.price?.priceInEth || '0');
+          const decimals = reserve.reserve.decimals || 18;
           const hasCollateral = reserve.usageAsCollateralEnabledOnUser && parseFloat(reserve.currentATokenBalance) > 0;
           const hasDebt = parseFloat(reserve.currentTotalDebt) > 0;
 
           if (hasCollateral) {
-            const balance = parseFloat(reserve.currentATokenBalance);
+            const balance = parseFloat(reserve.currentATokenBalance) / (10 ** decimals);
             const collateralBase = balance * priceInEth;
             const liqThreshold = parseFloat(reserve.reserve.reserveLiquidationThreshold || '0');
             totalThresholdBase += collateralBase * (liqThreshold / 10000);
           }
 
           if (hasDebt) {
-            const debt = parseFloat(reserve.currentTotalDebt);
+            const debt = parseFloat(reserve.currentTotalDebt) / (10 ** decimals);
             totalDebtBase += debt * priceInEth;
             debtAssets.push(reserve.reserve.underlyingAsset);
           }
