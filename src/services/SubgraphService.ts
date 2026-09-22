@@ -148,13 +148,13 @@ export class SubgraphService {
 
         const estimatedHF = totalDebtBase === 0 ? Infinity : totalThresholdBase / totalDebtBase;
 
-        if (estimatedHF < 1.5) {
+        if (estimatedHF <= 1.15) {
           candidateUsers.set(userAddress, debtAssets);
         } else {
           filteredHealthy++;
         }
       }
-      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF >= 1.5)`);
+      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF > 1.15)`);
       logger.info(`Returning ${candidateUsers.size} candidate users for on-chain validation`);
       return candidateUsers;
   }

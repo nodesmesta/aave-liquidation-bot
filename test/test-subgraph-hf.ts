@@ -32,7 +32,7 @@ async function main() {
   const candidates = await subgraphService.getActiveBorrowers();
   const elapsed = Date.now() - startTime;
 
-  logger.info(`Test complete in ${elapsed}ms: Found ${candidates.size} candidates with Estimated HF < 1.5.`);
+  logger.info(`Test complete in ${elapsed}ms: Found ${candidates.size} candidates with Estimated HF <= 1.15.`);
   
   if (candidates.size > 0) {
     const firstCandidate = Array.from(candidates.keys())[0];
