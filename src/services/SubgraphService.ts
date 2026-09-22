@@ -2,6 +2,7 @@ import { GraphQLClient, gql } from 'graphql-request';
 import { parseAbi, Address } from 'viem';
 import { logger } from '../utils/logger';
 import { config } from '../config';
+import { AssetManager } from './AssetManager';
 
 interface UserReserve {
   reserve: {
@@ -28,19 +29,12 @@ interface User {
 
 export class SubgraphService {
   private client: GraphQLClient;
-  private reservesListCache: Map<string, Address[]> = new Map();  
-  private reservesDecimalsCache: Map<string, Map<string, number>> = new Map();
-  private readonly STABLE_ASSETS = new Set([
-    'USDC',
-    'USDbC',
-    'GHO',
-    'EURC'
-  ]);
-
+  private assetManager: AssetManager;
   private publicClient: any;
 
-  constructor(subgraphUrl: string, publicClient: any, apiKey?: string) {
+  constructor(subgraphUrl: string, publicClient: any, assetManager: AssetManager, apiKey?: string) {
     this.publicClient = publicClient;
+    this.assetManager = assetManager;
     const key = apiKey || process.env.SUBGRAPH_API_KEY || '';
     this.client = new GraphQLClient(subgraphUrl, {
       headers: {
@@ -87,6 +81,11 @@ export class SubgraphService {
               reserve {
                 symbol
                 underlyingAsset
+                decimals
+                reserveLiquidationThreshold
+                price {
+                  priceInEth
+                }
               }
             }
           }
@@ -120,35 +119,41 @@ export class SubgraphService {
     logger.info(`Total found: ${allUsers.length} users with debt`);
       
       const candidateUsers = new Map<string, string[]>();
-      let filteredByStablecoin = 0;
+      let filteredHealthy = 0;
       for (const user of allUsers) {
         const userAddress = user.id.toLowerCase();
-        const collateralAssets: string[] = [];
+        let totalDebtBase = 0;
+        let totalThresholdBase = 0;
         const debtAssets: string[] = [];
+
         for (const reserve of user.reserves) {
-          const symbol = reserve.reserve.symbol;
-          const balance = parseFloat(reserve.currentATokenBalance);
-          const debt = parseFloat(reserve.currentTotalDebt);
-          const hasCollateral = balance > 0 && reserve.usageAsCollateralEnabledOnUser;
-          const hasDebt = debt > 0;
-          if (hasCollateral) collateralAssets.push(symbol);
-          if (hasDebt) debtAssets.push(symbol);
+          const priceInEth = parseFloat(reserve.reserve.price?.priceInEth || '0');
+          const hasCollateral = reserve.usageAsCollateralEnabledOnUser && parseFloat(reserve.currentATokenBalance) > 0;
+          const hasDebt = parseFloat(reserve.currentTotalDebt) > 0;
+
+          if (hasCollateral) {
+            const balance = parseFloat(reserve.currentATokenBalance);
+            const collateralBase = balance * priceInEth;
+            const liqThreshold = parseFloat(reserve.reserve.reserveLiquidationThreshold || '0');
+            totalThresholdBase += collateralBase * (liqThreshold / 10000);
+          }
+
+          if (hasDebt) {
+            const debt = parseFloat(reserve.currentTotalDebt);
+            totalDebtBase += debt * priceInEth;
+            debtAssets.push(reserve.reserve.underlyingAsset);
+          }
         }
-        const allStablecoinCollateral = collateralAssets.every(a => this.STABLE_ASSETS.has(a));
-        const allStablecoinDebt = debtAssets.every(a => this.STABLE_ASSETS.has(a));
-        if (allStablecoinCollateral && allStablecoinDebt) {
-          filteredByStablecoin++;
-          continue;
-        }
-        const hasUnhedgedCollateral = collateralAssets.some(c => !debtAssets.includes(c));
-        const hasCrossAssetDebt = debtAssets.some(d => !collateralAssets.includes(d));
-        if (hasUnhedgedCollateral || hasCrossAssetDebt) {
-          candidateUsers.set(userAddress, debtAssets.map(symbol => 
-            user.reserves.find(r => r.reserve.symbol === symbol)?.reserve.underlyingAsset || ''
-          ).filter(addr => addr !== ''));
+
+        const estimatedHF = totalDebtBase === 0 ? Infinity : totalThresholdBase / totalDebtBase;
+
+        if (estimatedHF < 1.5) {
+          candidateUsers.set(userAddress, debtAssets);
+        } else {
+          filteredHealthy++;
         }
       }
-      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredByStablecoin} stablecoin-only)`);
+      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF >= 1.5)`);
       logger.info(`Returning ${candidateUsers.size} candidate users for on-chain validation`);
       return candidateUsers;
   }
@@ -183,40 +188,8 @@ export class SubgraphService {
     let totalValidated = 0;
     let filteredByHF = 0;
     let filteredByHedging = 0;
-    let reservesList: Address[];
-    let reservesDecimals: Map<string, number>;
-    const cacheKey = `${poolAddress}`;
-    if (this.reservesListCache.has(cacheKey) && this.reservesDecimalsCache.has(cacheKey)) {
-      reservesList = this.reservesListCache.get(cacheKey)!;
-      reservesDecimals = this.reservesDecimalsCache.get(cacheKey)!;
-    } else {
-      reservesList = await client.readContract({
-        address: poolAddress as Address,
-        abi: poolAbi,
-        functionName: 'getReservesList',
-      }) as Address[];
-      const decimalsAbi = parseAbi([
-        'function getReserveConfigurationData(address asset) external view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen)',
-      ]);
-      const decimalsCalls = reservesList.map(reserve => ({
-        address: protocolDataProvider as Address,
-        abi: decimalsAbi,
-        functionName: 'getReserveConfigurationData',
-        args: [reserve],
-      }));
-      const decimalsResults = await client.multicall({
-        contracts: decimalsCalls,
-      });
-      reservesDecimals = new Map();
-      for (let i = 0; i < reservesList.length; i++) {
-        if (decimalsResults[i].status === 'success' && decimalsResults[i].result) {
-          const [decimals] = decimalsResults[i].result as readonly [bigint, bigint, bigint, bigint, bigint, boolean, boolean, boolean, boolean, boolean];
-          reservesDecimals.set(reservesList[i].toLowerCase(), Number(decimals));
-        }
-      }
-      this.reservesListCache.set(cacheKey, reservesList);
-      this.reservesDecimalsCache.set(cacheKey, reservesDecimals);
-    }
+    const allReserves = this.assetManager.getAllReserves();
+    const reservesList = allReserves.map(r => r.address as Address);
 
     try {
       const BATCH_SIZE = config.rateLimit.batchSize;
@@ -361,7 +334,8 @@ export class SubgraphService {
                       const [currentATokenBalance, , currentVariableDebt, , , , , , usageAsCollateralEnabled] = reserveResult.result as readonly [bigint, bigint, bigint, bigint, bigint, bigint, bigint, number, boolean];
                       const reserveIndex = reserveIndices[k];
                       const reserveAddress = reservesList[reserveIndex].toLowerCase();
-                      const decimals = reservesDecimals.get(reserveAddress) || 18;
+                      const config = this.assetManager.getAssetConfig(reserveAddress);
+                      const decimals = config?.decimals || 18;
                       const collateralAmount = Number(currentATokenBalance) / (10 ** decimals);
                       const debtAmount = Number(currentVariableDebt) / (10 ** decimals);
                       const hasSignificantCollateral = collateralAmount > 0.01 && usageAsCollateralEnabled;

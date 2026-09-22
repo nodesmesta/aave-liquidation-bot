@@ -55,11 +55,11 @@ class LiquidatorBot {
       this.account
     );
     this.priceOracle = new PriceOracle(this.globalRpcClient);
-    this.subgraphService = new SubgraphService(config.aave.subgraphUrl, this.globalRpcClient);
     this.assetManager = new AssetManager(
       this.globalRpcClient,
       config.aave.protocolDataProvider
     );
+    this.subgraphService = new SubgraphService(config.aave.subgraphUrl, this.globalRpcClient, this.assetManager);
     this.optimizedLiquidation = new OptimizedLiquidationService(
       this.globalRpcClient,
       config.aave.protocolDataProvider,
