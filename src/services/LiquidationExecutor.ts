@@ -23,7 +23,8 @@ export interface ExecutionResult {
 export class LiquidationExecutor {
   private account: ReturnType<typeof createAccount>;
   private walletClient: ReturnType<typeof viemCreateWalletClient>;
-  private publicClient: any;
+  private rpcClient: any;
+  private flashblocksClient: any;
   private gasManager: GasManager;
   private nonceManager: NonceManager;
   private chain: Chain;
@@ -44,12 +45,14 @@ export class LiquidationExecutor {
   constructor(rpcClient: any, preconfClient: any, account?: ReturnType<typeof createAccount>) {
     this.account = account || createAccount();
     this.chain = basePreconf;
+    // Broadcast via Premium RPC privat
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
       transport: http(config.network.rpcUrl),
     });
-    this.publicClient = preconfClient;
+    this.rpcClient = rpcClient;
+    this.flashblocksClient = preconfClient;
     this.gasManager = new GasManager(rpcClient);
     this.nonceManager = new NonceManager(rpcClient, this.account.address);
     if (!config.liquidator.address) {
@@ -59,11 +62,11 @@ export class LiquidationExecutor {
 
   /**
    * @notice Initialize nonce and gas managers at bot startup
-   * @dev Initializes nonce manager and confirms flashblocks integration
+   * @dev Initializes nonce manager and logs RPC separation architecture
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
-    logger.info(`Flashblocks integration: walletClient (broadcast) and publicClient (receipt) via mainnet-preconf.base.org`);
+    logger.info(`RPC Architecture: walletClient broadcast via Premium RPC, Flashblocks sequencer verification via ${config.network.preconfUrl}`);
   }
 
   /**
@@ -76,9 +79,8 @@ export class LiquidationExecutor {
   }
 
   /**
-   * @notice Poll transaction receipt from Flashblocks endpoint
-   * @dev Standard eth_getTransactionReceipt call on Flashblocks-aware RPC
-   * Flashblocks returns receipt when TX is preconfirmed (200ms) or on-chain
+   * @notice Poll transaction receipt from Flashblocks endpoint with Premium RPC fallback
+   * @dev Standard eth_getTransactionReceipt call on Flashblocks-aware RPC with fallback to premium RPC
    * @param hash Transaction hash to poll
    * @param maxWaitTime Max wait time in ms (default 5s for Flashblocks preconf timing)
    * @return Transaction receipt or null if timeout
@@ -87,35 +89,76 @@ export class LiquidationExecutor {
     const pollInterval = 100;
     const startTime = Date.now();
     while (Date.now() - startTime < maxWaitTime) {
-      const receipt = await this.publicClient.getTransactionReceipt({ hash });
-      if (receipt) {
-        return receipt;
+      try {
+        const receipt = await this.flashblocksClient.getTransactionReceipt({ hash });
+        if (receipt) {
+          return receipt;
+        }
+      } catch {
+        // Fallback ke Premium RPC jika endpoint Flashblocks mengalami rate limit
+        try {
+          const receipt = await this.rpcClient.getTransactionReceipt({ hash });
+          if (receipt) {
+            return receipt;
+          }
+        } catch {}
       }
       await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
+    // Final verification ke Premium RPC sebelum menyatakan timeout
+    try {
+      const finalReceipt = await this.rpcClient.getTransactionReceipt({ hash });
+      if (finalReceipt) {
+        return finalReceipt;
+      }
+    } catch {}
     return null;
   }
 
   /**
-   * @notice Calculate gas settings for liquidation with affordability check
-   * @dev Fetches network fees, calculates boosted gas settings, and validates against wallet balance
+   * @notice Calculate gas settings for liquidation with affordability and net profit checks
+   * @dev Fetches network fees, calculates boosted gas settings, and validates against wallet balance & net profitability
    * @param gasLimit Gas limit for the transaction
    * @param liquidationValueUSD Estimated liquidation value in USD
    * @param walletBalanceETH Wallet balance in ETH for affordability check
-   * @return Gas settings with affordability flag, or null if unaffordable
+   * @param grossProfitUSD Estimated gross profit in USD (estimatedValue - debtToCoverUSD)
+   * @param ethPriceUSD Current ETH price in USD for gas cost conversion
+   * @return Gas settings with net profit metadata, or null if unaffordable / unprofitable
    */
   async calculateAffordableGasSettings(
     gasLimit: bigint,
     liquidationValueUSD: number,
-    walletBalanceETH: number
-  ): Promise<{ gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }; maxGasCostETH: number } | null> {
+    walletBalanceETH: number,
+    grossProfitUSD?: number,
+    ethPriceUSD?: number
+  ): Promise<{ 
+    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }; 
+    maxGasCostETH: number;
+    maxGasCostUSD?: number;
+    netProfitUSD?: number;
+  } | null> {
     const baseFees = await this.gasManager.getEstimatedFees();
     const gasSettings = this.gasManager.calculateGasSettings(baseFees, gasLimit, liquidationValueUSD);
     const maxGasCostETH = this.gasManager.calculateMaxGasCostETH(gasSettings);
     if (walletBalanceETH < maxGasCostETH) {
       return null;
     }
-    return { gasSettings, maxGasCostETH };
+
+    // Net Profit Validation (Anti-Bleeding Gas Guard)
+    let maxGasCostUSD: number | undefined;
+    let netProfitUSD: number | undefined;
+    if (grossProfitUSD !== undefined && ethPriceUSD !== undefined && ethPriceUSD > 0) {
+      maxGasCostUSD = maxGasCostETH * ethPriceUSD;
+      netProfitUSD = grossProfitUSD - maxGasCostUSD;
+      if (netProfitUSD <= 0) {
+        logger.warn(
+          `Liquidation unprofitable: Gross profit $${grossProfitUSD.toFixed(2)} <= Max gas cost $${maxGasCostUSD.toFixed(2)} (Net: $${netProfitUSD.toFixed(2)}). Skipping.`
+        );
+        return null;
+      }
+    }
+
+    return { gasSettings, maxGasCostETH, maxGasCostUSD, netProfitUSD };
   }
 
   /**
@@ -177,7 +220,7 @@ export class LiquidationExecutor {
     }
     try {
       const verifyStart = Date.now();
-      const statusResponse: any = await this.publicClient.transport.request({
+      const statusResponse: any = await this.flashblocksClient.transport.request({
         method: 'base_transactionStatus',
         params: [hash],
       });

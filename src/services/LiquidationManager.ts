@@ -1,5 +1,6 @@
-import { formatEther } from 'viem';
+import { formatEther, parseAbi, Address } from 'viem';
 import { logger } from '../utils/logger';
+import { config } from '../config';
 import { UserHealth, HealthChecker } from './HealthChecker';
 import { LiquidationExecutor } from './LiquidationExecutor';
 import { PriceUpdate } from './PriceOracle';
@@ -128,21 +129,40 @@ export class LiquidationManager {
     const balanceETH = Number(formatEther(balance));
     const fixedGasLimit = 920000n;
     let skippedCount = 0;
+
+    // Ambil harga ETH live dari Aave Oracle untuk kalkulasi gas USD
+    const WETH_ADDRESS = '0x4200000000000000000000000000000000000006' as Address;
+    let ethPriceUSD = 3000;
+    try {
+      const ethPriceRaw = await this.globalRpcClient.readContract({
+        address: config.aave.oracle as Address,
+        abi: parseAbi(['function getAssetPrice(address asset) external view returns (uint256)']),
+        functionName: 'getAssetPrice',
+        args: [WETH_ADDRESS],
+      });
+      ethPriceUSD = Number(ethPriceRaw) / 1e8;
+    } catch {
+      logger.debug(`Using fallback ETH price: $${ethPriceUSD}`);
+    }
     
     for (const liq of validLiquidations) {
+      const grossProfitUSD = liq.params.estimatedValue - liq.params.debtToCoverUSD;
       const gasResult = await this.executor.calculateAffordableGasSettings(
         fixedGasLimit,
         liq.params.estimatedValue,
-        balanceETH
+        balanceETH,
+        grossProfitUSD,
+        ethPriceUSD
       );
       
       if (gasResult) {
         const skip = skippedCount > 0 ? ` (skipped ${skippedCount})` : '';
-        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH (${paramsLatency}ms)`);
+        const netStr = gasResult.netProfitUSD !== undefined ? ` netProfit:$${gasResult.netProfitUSD.toFixed(2)}` : '';
+        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH ($${(gasResult.maxGasCostUSD || 0).toFixed(2)})${netStr} (${paramsLatency}ms)`);
         return { user: liq.userHealth, params: liq.params, gasSettings: gasResult.gasSettings };
       } else {
         skippedCount++;
-        logger.debug(`Skip #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} ($${liq.params.estimatedValue.toFixed(0)}): insufficient balance`);
+        logger.debug(`Skip #${skippedCount} ${liq.params.collateralSymbol}→${liq.params.debtSymbol} ($${liq.params.estimatedValue.toFixed(0)}): insufficient balance or unprofitable`);
       }
     }
     
