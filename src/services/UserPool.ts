@@ -61,49 +61,51 @@ export class UserPool {
   /**
    * @notice Get users that have a specific asset in their collateral
    * @dev Monitors collateral price drops (reduces HF)
-   * @param assetSymbol Asset symbol to filter by
+   * @param assetAddress Asset contract address to filter by
    * @return Array of users with specified collateral
    */
-  getUsersWithCollateral(assetSymbol: string): TrackedUser[] {
+  getUsersWithCollateral(assetAddress: string): TrackedUser[] {
+    const normalizedAddress = assetAddress.toLowerCase();
     return this.getAllUsers().filter(user => 
-      user.collateralAssets.includes(assetSymbol)
+      user.collateralAssets.some(asset => asset.toLowerCase() === normalizedAddress)
     );
   }
 
   /**
    * @notice Get users that have a specific asset in their debt
    * @dev Monitors debt price rises (reduces HF)
-   * @param assetSymbol Asset symbol to filter by
+   * @param assetAddress Asset contract address to filter by
    * @return Array of users with specified debt
    */
-  getUsersWithDebt(assetSymbol: string): TrackedUser[] {
+  getUsersWithDebt(assetAddress: string): TrackedUser[] {
+    const normalizedAddress = assetAddress.toLowerCase();
     return this.getAllUsers().filter(user => 
-      user.debtAssets.includes(assetSymbol)
+      user.debtAssets.some(asset => asset.toLowerCase() === normalizedAddress)
     );
   }
 
   /**
-   * @notice Get unique collateral asset symbols across all tracked users
+   * @notice Get unique collateral asset addresses across all tracked users
    * @dev Used for dynamic price monitoring - only subscribe to assets that users actually have
-   * @return Array of unique collateral asset symbols
+   * @return Array of unique collateral asset addresses
    */
   getUniqueCollateralAssets(): string[] {
     const uniqueAssets = new Set<string>();
     for (const user of this.getAllUsers()) {
-      user.collateralAssets.forEach(asset => uniqueAssets.add(asset));
+      user.collateralAssets.forEach(asset => uniqueAssets.add(asset.toLowerCase()));
     }
     return Array.from(uniqueAssets);
   }
 
   /**
-   * @notice Get unique debt asset symbols across all tracked users
+   * @notice Get unique debt asset addresses across all tracked users
    * @dev Used for price monitoring - debt price increases reduce HF
-   * @return Array of unique debt asset symbols
+   * @return Array of unique debt asset addresses
    */
   getUniqueDebtAssets(): string[] {
     const uniqueAssets = new Set<string>();
     for (const user of this.getAllUsers()) {
-      user.debtAssets.forEach(asset => uniqueAssets.add(asset));
+      user.debtAssets.forEach(asset => uniqueAssets.add(asset.toLowerCase()));
     }
     return Array.from(uniqueAssets);
   }

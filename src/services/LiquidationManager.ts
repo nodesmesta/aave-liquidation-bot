@@ -36,9 +36,9 @@ export class LiquidationManager {
     const highRiskUsers = new Set<string>();
     const allAffectedUsers = new Set<string>();
     for (const update of updates) {
-      const assetSymbol = this.assetManager.getSymbol(update.asset);
-      const usersWithCollateral = this.userPool.getUsersWithCollateral(assetSymbol);
-      const usersWithDebt = this.userPool.getUsersWithDebt(assetSymbol);
+      const assetAddress = update.asset.toLowerCase();
+      const usersWithCollateral = this.userPool.getUsersWithCollateral(assetAddress);
+      const usersWithDebt = this.userPool.getUsersWithDebt(assetAddress);
       const highRiskCollateral = usersWithCollateral.filter(u => u.lastCheckedHF <= 1.03);
       const highRiskDebt = usersWithDebt.filter(u => u.lastCheckedHF <= 1.03);
       highRiskCollateral.forEach(user => highRiskUsers.add(user.address));
@@ -48,6 +48,7 @@ export class LiquidationManager {
       const totalAffected = allAffectedUsers.size;
       const highRiskCount = highRiskUsers.size;
       if (totalAffected > 0) {
+        const assetSymbol = this.assetManager.getSymbol(update.asset) || update.asset;
         const direction = update.percentChange > 0 ? '↑' : '↓';
         logger.info(`${assetSymbol} ${direction}${Math.abs(update.percentChange).toFixed(2)}% ($${update.oldPrice.toFixed(2)}→$${update.newPrice.toFixed(2)}) affects ${totalAffected} users (${highRiskCount} high-risk)`);
       }

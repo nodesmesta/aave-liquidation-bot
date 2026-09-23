@@ -107,14 +107,13 @@ class LiquidatorBot {
       }
       logger.info(`Loaded ${validationResults.size} users (${candidatesMap.size} scanned)`);
       for (const [address, data] of validationResults.entries()) {
-        const collateralSymbols = data.collateralAssets.map((addr: string) => this.assetManager.getSymbol(addr) || addr);
         this.userPool.addUser({
           address: address,
           estimatedHF: data.hf,
           collateralUSD: data.collateral,
           debtUSD: data.debt,
-          collateralAssets: collateralSymbols,
-          debtAssets: data.debtAssets.map((addr: string) => this.assetManager.getSymbol(addr) || addr),
+          collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+          debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
           lastCheckedHF: data.hf,
           lastUpdated: Date.now(),
           addedAt: Date.now()
@@ -140,6 +139,12 @@ class LiquidatorBot {
     await this.checkConnection();
     await this.initialize();
     await this.ensurePriceMonitoring();
+    
+    // Background Job: Discovery & Pruning every 6 hours
+    setInterval(() => {
+      this.startBackgroundSync();
+    }, 6 * 60 * 60 * 1000);
+    
     setInterval(() => {
       this.exportUserPoolSnapshot();
     }, 10 * 60 * 1000);
@@ -235,6 +240,68 @@ class LiquidatorBot {
   }
 
 
+
+  /**
+   * @notice Background job for dynamic user discovery and pruning
+   * @dev Runs periodically to find new borrowers and prune safe ones
+   */
+  private async startBackgroundSync(): Promise<void> {
+    if (!this.isInitialized || this.isRestarting) return;
+    logger.info('Starting background sync (Discovery & Pruning)...');
+    try {
+      const allTrackedUsers = this.userPool.getAllUsers().map(u => u.address);
+      if (allTrackedUsers.length > 0) {
+        logger.info(`Pruning: Validating ${allTrackedUsers.length} existing users...`);
+        const healthMap = await this.healthChecker.checkUsers(allTrackedUsers);
+        let pruned = 0;
+        for (const [address, health] of healthMap.entries()) {
+          if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
+            this.userPool.removeUser(address);
+            pruned++;
+          } else {
+            this.userPool.updateUserHF(address, health.healthFactor);
+          }
+        }
+        logger.info(`Pruning complete: Removed ${pruned} safe/repaid users.`);
+      }
+
+      logger.info('Discovery: Querying subgraph for new active borrowers...');
+      const candidatesMap = await this.subgraphService.getActiveBorrowers();
+      const newAddresses = Array.from(candidatesMap.keys()).filter(addr => 
+        !allTrackedUsers.includes(addr.toLowerCase())
+      );
+      
+      if (newAddresses.length > 0) {
+        logger.info(`Discovery: Found ${newAddresses.length} new candidates to validate.`);
+        const validationResults = await this.subgraphService.validateUsersOnChain(
+          newAddresses,
+          config.aave.pool,
+          config.aave.protocolDataProvider
+        );
+        let added = 0;
+        for (const [address, data] of validationResults.entries()) {
+          this.userPool.addUser({
+            address: address,
+            estimatedHF: data.hf,
+            collateralUSD: data.collateral,
+            debtUSD: data.debt,
+            collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+            debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+            lastCheckedHF: data.hf,
+            lastUpdated: Date.now(),
+            addedAt: Date.now()
+          });
+          added++;
+        }
+        logger.info(`Discovery complete: Added ${added} new at-risk users to pool.`);
+      } else {
+        logger.info('Discovery complete: No new candidates found.');
+      }
+      this.userPool.logStatus();
+    } catch (error) {
+      logger.error('Error during background sync:', error);
+    }
+  }
 
   /**
    * @notice Export UserPool snapshot to JSON file for monitoring (async, non-blocking)
