@@ -24,6 +24,7 @@ export class PriceOracle {
   private aggregators: Map<string, ChainlinkAggregator> = new Map();
   private unsubscribeFns: (() => void)[] = [];
   private onFatalError: (() => void) | null = null;
+  private onPriceChangeCallback: ((updates: PriceUpdate[]) => void) | null = null;
   private readonly AAVE_ORACLE: `0x${string}`;
   private ORACLE_ABI = [
     {
@@ -56,13 +57,6 @@ export class PriceOracle {
       inputs: [],
       name: 'decimals',
       outputs: [{ name: '', type: 'uint8' }],
-      stateMutability: 'view',
-      type: 'function',
-    },
-    {
-      inputs: [],
-      name: 'aggregator',
-      outputs: [{ name: '', type: 'address' }],
       stateMutability: 'view',
       type: 'function',
     },
@@ -134,6 +128,7 @@ export class PriceOracle {
    */
   async startPriceMonitoring(assets: string[], onPriceChange: (updates: PriceUpdate[]) => void, wssUrl: string): Promise<void> {
     if (this.isMonitoring) return;
+    this.onPriceChangeCallback = onPriceChange;
     this.initializeWebSocketClient(wssUrl);
     await this.setupChainlinkAggregators(assets);
     this.subscribeToChainlinkEvents(assets, onPriceChange);
@@ -170,31 +165,25 @@ export class PriceOracle {
         }
       }
     }
-    const aggregatorCalls = validProxies.map(proxy => ({
-      address: proxy,
-      abi: this.CHAINLINK_ABI,
-      functionName: 'aggregator',
-    }));
+    // Hanya ambil decimals dari Proxy. Tidak perlu resolve underlying aggregator
+    // karena target watchEvent adalah Proxy itu sendiri (Proxy Phase Shift fix).
     const decimalsCalls = validProxies.map(proxy => ({
       address: proxy,
       abi: this.CHAINLINK_ABI,
       functionName: 'decimals',
     }));
-    const detailsResults = await this.publicClient.multicall({
-      contracts: [...aggregatorCalls, ...decimalsCalls],
+    const decimalsResults = await this.publicClient.multicall({
+      contracts: decimalsCalls,
       allowFailure: true,
     });
-    const aggregatorResults = detailsResults.slice(0, validProxies.length);
-    const decimalsResults = detailsResults.slice(validProxies.length);
     for (let i = 0; i < validAssets.length; i++) {
       const asset = validAssets[i];
-      const underlyingAddress = aggregatorResults[i].status === 'success' 
-        ? aggregatorResults[i].result as `0x${string}` 
-        : validProxies[i];
-      const decimals = decimalsResults[i].status === 'success' 
-        ? decimalsResults[i].result as number 
+      const decimals = decimalsResults[i].status === 'success'
+        ? decimalsResults[i].result as number
         : 8;
-      this.aggregators.set(asset, { address: underlyingAddress, decimals });
+      // Simpan proxyAddress (permanen) sebagai alamat target event listener,
+      // BUKAN underlying aggregator (yang bisa berubah saat Chainlink upgrade).
+      this.aggregators.set(asset, { address: validProxies[i], decimals });
     }
   }
 
@@ -251,6 +240,55 @@ export class PriceOracle {
       },
     });
     this.unsubscribeFns.push(unsubscribe);
+  }
+
+  /**
+   * @notice Add a new asset to monitoring without restarting the WebSocket connection
+   * @dev Fetches Chainlink Proxy data for the asset, then triggers a full re-subscribe
+   * with the updated aggregator list. Re-subscribe is necessary because Viem watchEvent
+   * address filter cannot be amended after creation.
+   * @param assetAddress Underlying asset contract address (Aave reserve token)
+   */
+  public async addAsset(assetAddress: string): Promise<void> {
+    const normalized = assetAddress.toLowerCase();
+    if (this.aggregators.has(normalized)) {
+      logger.debug(`[PriceOracle] ${normalized} already monitored, skipping addAsset`);
+      return;
+    }
+    await this.setupChainlinkAggregators([normalized]);
+    if (!this.aggregators.has(normalized)) {
+      logger.warn(`[PriceOracle] addAsset: no valid Chainlink Proxy found for ${normalized}, skipping`);
+      return;
+    }
+    if (this.isMonitoring && this.onPriceChangeCallback) {
+      this.unsubscribeFns.forEach(unsub => unsub());
+      this.unsubscribeFns = [];
+      this.subscribeToChainlinkEvents([], this.onPriceChangeCallback);
+    }
+    logger.info(`[PriceOracle] Asset added: ${normalized}. Monitoring ${this.aggregators.size} assets.`);
+  }
+
+  /**
+   * @notice Remove an asset from monitoring without restarting the WebSocket connection
+   * @dev Removes asset from aggregators map and lastPrices cache, then re-subscribes
+   * with the remaining aggregators. If no assets remain, subscriptions are cleared.
+   * @param assetAddress Underlying asset contract address (Aave reserve token)
+   */
+  public removeAsset(assetAddress: string): void {
+    const normalized = assetAddress.toLowerCase();
+    if (!this.aggregators.has(normalized)) {
+      return;
+    }
+    this.aggregators.delete(normalized);
+    this.lastPrices.delete(normalized);
+    if (this.isMonitoring && this.onPriceChangeCallback) {
+      this.unsubscribeFns.forEach(unsub => unsub());
+      this.unsubscribeFns = [];
+      if (this.aggregators.size > 0) {
+        this.subscribeToChainlinkEvents([], this.onPriceChangeCallback);
+      }
+    }
+    logger.info(`[PriceOracle] Asset removed: ${normalized}. Monitoring ${this.aggregators.size} assets.`);
   }
 
   /**

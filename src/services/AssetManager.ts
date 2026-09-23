@@ -2,6 +2,7 @@ import { Address, PublicClient, parseAbi } from 'viem';
 import { AaveV3Base } from '@bgd-labs/aave-address-book';
 import { logger } from '../utils/logger';
 import { config } from '../config';
+import { PriceOracle } from './PriceOracle';
 
 export interface AssetConfig {
   decimals: number;
@@ -161,8 +162,9 @@ export class AssetManager {
   /**
    * @notice Mengaktifkan event listener pada kontrak Aave PoolConfigurator.
    * @dev Fungsi ini akan memantau perubahan status aset secara real-time dari blockchain.
+   * @param priceOracle Referensi PriceOracle untuk sinkronisasi subscription harga otomatis.
    */
-  public startEventListening(): void {
+  public startEventListening(priceOracle?: PriceOracle): void {
     logger.info('Starting Aave PoolConfigurator Event Listener...');
 
     // 1. ReserveInitialized (Saat koin baru didaftarkan ke Aave)
@@ -175,8 +177,9 @@ export class AssetManager {
           const assetAddress = log.args.asset;
           if (assetAddress) {
             logger.info(`[Event] New Reserve Initialized: ${assetAddress}. Re-syncing cache...`);
-            // Lakukan sinkronisasi ulang secara penuh
             await this.initialize();
+            // Instruksikan PriceOracle untuk mulai memantau harga aset baru ini.
+            await priceOracle?.addAsset(assetAddress.toLowerCase());
           }
         }
       }
@@ -194,15 +197,20 @@ export class AssetManager {
           if (assetAddress && isPaused) {
             logger.info(`[Event] Reserve Paused: ${assetAddress}. Removing from monitor.`);
             this.addressesToMonitor = this.addressesToMonitor.filter(a => a !== assetAddress);
+            // Instruksikan PriceOracle untuk berhenti memantau harga aset yang dibekukan.
+            priceOracle?.removeAsset(assetAddress);
           } else if (assetAddress && !isPaused) {
             logger.info(`[Event] Reserve Unpaused: ${assetAddress}. Re-syncing cache...`);
             await this.initialize();
+            // Instruksikan PriceOracle untuk kembali memantau harga aset yang diaktifkan.
+            await priceOracle?.addAsset(assetAddress);
           }
         }
       }
     });
 
     // 3. CollateralConfigurationChanged (Saat Aave mengubah angka Liquidation Bonus / LTV)
+    // Tidak ada interaksi dengan PriceOracle karena event ini hanya mengubah parameter kalkulasi.
     this.publicClient.watchContractEvent({
       address: AaveV3Base.POOL_CONFIGURATOR as Address,
       abi: this.configuratorEventsAbi,

@@ -87,7 +87,7 @@ class LiquidatorBot {
       logger.info('Initializing bot (strategy: USDC debt, HF < 1.075)...');
       await this.executor.initialize();
       await this.assetManager.initialize();
-      this.assetManager.startEventListening();
+      this.assetManager.startEventListening(this.priceOracle);
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
       if (candidatesMap.size === 0) {
         logger.warn('No candidates found from subgraph');
@@ -217,8 +217,7 @@ class LiquidatorBot {
    */
   private async ensurePriceMonitoring(): Promise<void> {
     if (this.isPriceMonitoring) return;
-    // TODO (Task 2.2): Gunakan this.assetManager.getAddressesToMonitor()
-    const assetsToMonitor: string[] = []; 
+    const assetsToMonitor = this.assetManager.getAddressesToMonitor();
     if (assetsToMonitor.length === 0) {
       logger.warn('No volatile assets to monitor (AssetManager not initialized yet)');
       return;
