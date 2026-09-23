@@ -60,6 +60,13 @@ export class PriceOracle {
       stateMutability: 'view',
       type: 'function',
     },
+    {
+      inputs: [],
+      name: 'aggregator',
+      outputs: [{ name: '', type: 'address' }],
+      stateMutability: 'view',
+      type: 'function',
+    },
   ] as const;
 
   constructor(publicClient: any) {
@@ -165,25 +172,33 @@ export class PriceOracle {
         }
       }
     }
-    // Hanya ambil decimals dari Proxy. Tidak perlu resolve underlying aggregator
-    // karena target watchEvent adalah Proxy itu sendiri (Proxy Phase Shift fix).
+    const aggregatorCalls = validProxies.map(proxy => ({
+      address: proxy,
+      abi: this.CHAINLINK_ABI,
+      functionName: 'aggregator',
+    }));
     const decimalsCalls = validProxies.map(proxy => ({
       address: proxy,
       abi: this.CHAINLINK_ABI,
       functionName: 'decimals',
     }));
-    const decimalsResults = await this.publicClient.multicall({
-      contracts: decimalsCalls,
+    const detailsResults = await this.publicClient.multicall({
+      contracts: [...aggregatorCalls, ...decimalsCalls],
       allowFailure: true,
     });
+    const aggregatorResults = detailsResults.slice(0, validProxies.length);
+    const decimalsResults = detailsResults.slice(validProxies.length);
     for (let i = 0; i < validAssets.length; i++) {
       const asset = validAssets[i];
+      const underlyingAddress = aggregatorResults[i].status === 'success'
+        ? aggregatorResults[i].result as `0x${string}`
+        : validProxies[i];
       const decimals = decimalsResults[i].status === 'success'
         ? decimalsResults[i].result as number
         : 8;
-      // Simpan proxyAddress (permanen) sebagai alamat target event listener,
-      // BUKAN underlying aggregator (yang bisa berubah saat Chainlink upgrade).
-      this.aggregators.set(asset, { address: validProxies[i], decimals });
+      // Target event listener adalah underlying aggregator (yang memancarkan AnswerUpdated),
+      // dengan fallback ke proxyAddress jika kontrak tidak memiliki underlying.
+      this.aggregators.set(asset, { address: underlyingAddress, decimals });
     }
   }
 
