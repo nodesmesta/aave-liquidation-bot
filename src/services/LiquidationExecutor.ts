@@ -30,6 +30,7 @@ export class LiquidationExecutor {
   private chain: Chain;
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
+    'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover, bytes swapPath) external',
     'function transferOwnership(address newOwner) external',
     'function approveToken(address token, address spender, uint256 amount) external',
     'function isAaveReserve(address token) public view returns (bool)',
@@ -45,11 +46,11 @@ export class LiquidationExecutor {
   constructor(rpcClient: any, preconfClient: any, account?: ReturnType<typeof createAccount>) {
     this.account = account || createAccount();
     this.chain = basePreconf;
-    // Broadcast via Premium RPC privat
+    // Broadcast langsung via Flashblocks Preconfirmation Sequencer
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
-      transport: http(config.network.rpcUrl),
+      transport: http(config.network.preconfUrl),
     });
     this.rpcClient = rpcClient;
     this.flashblocksClient = preconfClient;
@@ -66,7 +67,7 @@ export class LiquidationExecutor {
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
-    logger.info(`RPC Architecture: walletClient broadcast via Premium RPC, Flashblocks sequencer verification via ${config.network.preconfUrl}`);
+    logger.info(`RPC Architecture: walletClient broadcast via Flashblocks (${config.network.preconfUrl}), sequencer verification & receipts via Flashblocks`);
   }
 
   /**
@@ -178,7 +179,8 @@ export class LiquidationExecutor {
     user: string,
     debtToCover: bigint,
     estimatedValue: number,
-    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint }
+    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint },
+    swapPath?: `0x${string}`
   ): Promise<ExecutionResult> {
     this.stats.totalAttempts++;
     const { nonce, release } = await this.nonceManager.getNextNonce();
@@ -186,14 +188,21 @@ export class LiquidationExecutor {
     let prepareTime: number;
     let signTime: number;
     let broadcastTime: number;
-    logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}`);
+    const pathInfo = swapPath && swapPath !== '0x' ? ` [custom swapPath]` : '';
+    logger.info(`Executing liquidation: ${user.slice(0,6)}...${user.slice(-4)}, nonce ${nonce}, value $${estimatedValue.toFixed(0)}${pathInfo}`);
     try {
       const prepareStart = Date.now();
-      const data = encodeFunctionData({
-        abi: this.liquidatorAbi,
-        functionName: 'executeLiquidation',
-        args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
-      });
+      const data = (swapPath && swapPath !== '0x')
+        ? encodeFunctionData({
+            abi: this.liquidatorAbi,
+            functionName: 'executeLiquidation',
+            args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover, swapPath],
+          })
+        : encodeFunctionData({
+            abi: this.liquidatorAbi,
+            functionName: 'executeLiquidation',
+            args: [collateralAsset as Address, debtAsset as Address, user as Address, debtToCover],
+          });
       prepareTime = Date.now() - prepareStart;
       const signStart = Date.now();
       const signedTx = await this.account.signTransaction({

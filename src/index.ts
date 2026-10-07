@@ -14,6 +14,7 @@ import { UserPool } from './services/UserPool';
 import { AssetManager } from './services/AssetManager';
 import { LiquidationParams } from './services/OptimizedLiquidationService';
 import { LiquidationManager } from './services/LiquidationManager';
+import { SmartRouter } from './services/SmartRouter';
 
 class LiquidatorBot {
   private globalRpcClient: any;
@@ -24,6 +25,7 @@ class LiquidatorBot {
   private priceOracle: PriceOracle;
   private subgraphService: SubgraphService;
   private assetManager: AssetManager;
+  private smartRouter: SmartRouter;
   private optimizedLiquidation: OptimizedLiquidationService;
   private userPool: UserPool;
   private isInitialized = false;
@@ -60,10 +62,16 @@ class LiquidatorBot {
       config.aave.protocolDataProvider
     );
     this.subgraphService = new SubgraphService(config.aave.subgraphUrl, this.globalRpcClient, this.assetManager);
+    this.smartRouter = new SmartRouter(
+      this.globalRpcClient,
+      config.uniswap.quoterV2,
+      this.assetManager
+    );
     this.optimizedLiquidation = new OptimizedLiquidationService(
       this.globalRpcClient,
       config.aave.protocolDataProvider,
-      this.assetManager
+      this.assetManager,
+      this.smartRouter
     );
     this.userPool = new UserPool();
     this.liquidationManager = new LiquidationManager(
@@ -80,7 +88,7 @@ class LiquidatorBot {
 
   /**
    * @notice Initialize user pool from Subgraph and on-chain validation
-   * @dev Queries USDC borrowers, validates HF < 1.05
+   * @dev Queries USDC borrowers, validates HF < 1.075
    */
   async initialize(): Promise<void> {
     try {
@@ -120,6 +128,26 @@ class LiquidatorBot {
         });
       }
       this.userPool.logStatus();
+
+      // Pre-warm SmartRouter route cache for active user collateral/debt pairs
+      const uniquePairs = new Map<string, { tokenIn: string; tokenOut: string; sampleAmountIn: bigint }>();
+      for (const [, data] of validationResults.entries()) {
+        for (const c of data.collateralAssets) {
+          for (const d of data.debtAssets) {
+            if (c.toLowerCase() !== d.toLowerCase()) {
+              const pairKey = `${c.toLowerCase()}_${d.toLowerCase()}`;
+              if (!uniquePairs.has(pairKey)) {
+                uniquePairs.set(pairKey, { tokenIn: c, tokenOut: d, sampleAmountIn: 1000000n });
+              }
+            }
+          }
+        }
+      }
+      if (uniquePairs.size > 0) {
+        await this.smartRouter.prewarmRoutes(Array.from(uniquePairs.values()));
+        this.smartRouter.startPeriodicRefresh(() => Array.from(uniquePairs.values()), 5 * 60 * 1000);
+      }
+
       this.isInitialized = true;
       logger.info('Initialization complete');
     } catch (error) {

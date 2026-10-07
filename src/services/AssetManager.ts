@@ -160,6 +160,20 @@ export class AssetManager {
   }
 
   /**
+   * @notice Mendapatkan alamat token hub likuiditas utama (WETH, USDC, cbBTC) dari aset aktif Aave
+   */
+  public getRoutingHubs(): Address[] {
+    const hubSymbols = new Set(['WETH', 'USDC', 'CBBTC']);
+    const hubs: Address[] = [];
+    for (const [address, config] of this.assetConfigs.entries()) {
+      if (hubSymbols.has(config.symbol.toUpperCase())) {
+        hubs.push(address as Address);
+      }
+    }
+    return hubs;
+  }
+
+  /**
    * @notice Mengaktifkan event listener pada kontrak Aave PoolConfigurator.
    * @dev Fungsi ini akan memantau perubahan status aset secara real-time dari blockchain.
    * @param priceOracle Referensi PriceOracle untuk sinkronisasi subscription harga otomatis.

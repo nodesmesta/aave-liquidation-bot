@@ -32,6 +32,13 @@ export const config = {
     address: process.env.LIQUIDATOR_CONTRACT_ADDRESS || process.env.LIQUIDATOR_CONTRACT_ADDRESS_BASE || '',
   },
 
+  // Uniswap DEX Contracts
+  uniswap: {
+    quoterV2: (process.env.UNISWAP_QUOTER_V2 || '') as `0x${string}`,
+    universalRouter: (process.env.UNIVERSAL_ROUTER || '') as `0x${string}`,
+    permit2: (process.env.PERMIT2 || '') as `0x${string}`,
+  },
+
   // Logging
   logging: {
     level: process.env.LOG_LEVEL || 'info',
@@ -63,4 +70,13 @@ export function validateConfig(): void {
   if (!config.aave.subgraphUrl) {
     throw new Error('AAVE_SUBGRAPH_URL not set in environment. Get your API key from https://thegraph.com/studio/');
   }
+
+  if (!config.uniswap.quoterV2) {
+    throw new Error('UNISWAP_QUOTER_V2 not set in environment');
+  }
+
+  if (!config.uniswap.universalRouter) {
+    throw new Error('UNIVERSAL_ROUTER not set in environment');
+  }
 }
+

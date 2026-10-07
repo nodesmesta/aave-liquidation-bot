@@ -183,7 +183,8 @@ export class LiquidationManager {
         params.userAddress,
         params.debtToCover,
         params.estimatedValue,
-        gasSettings
+        gasSettings,
+        params.swapPath
       );
       const totalLatency = Date.now() - this.priceUpdateTimestamp;
       if (tx.success) {

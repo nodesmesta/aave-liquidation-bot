@@ -5,6 +5,8 @@ import { PriceOracle } from './PriceOracle';
 import { config } from '../config';
 
 import { AssetManager } from './AssetManager';
+import { SmartRouter } from './SmartRouter';
+
 export interface UserReserveData {
   asset: string;
   symbol: string;
@@ -25,6 +27,7 @@ export interface LiquidationParams {
   debtToCoverUSD: number;
   liquidationBonus: number;
   estimatedValue: number;
+  swapPath?: `0x${string}`;
 }
 
 export class OptimizedLiquidationService {
@@ -68,13 +71,20 @@ export class OptimizedLiquidationService {
 
 
   private assetManager: AssetManager;
+  private smartRouter?: SmartRouter;
 
-  constructor(publicClient: any, protocolDataProvider: string, assetManager: AssetManager) {
+  constructor(
+    publicClient: any,
+    protocolDataProvider: string,
+    assetManager: AssetManager,
+    smartRouter?: SmartRouter
+  ) {
     this.protocolDataProvider = protocolDataProvider;
     this.poolAddress = config.aave.pool;
     this.publicClient = publicClient;
     this.priceOracle = new PriceOracle(this.publicClient);
     this.assetManager = assetManager;
+    this.smartRouter = smartRouter;
   }
 
   /**
@@ -168,13 +178,13 @@ export class OptimizedLiquidationService {
    * @param userHealthFactor Health factor of the target user
    * @return Complete liquidation parameters or null if invalid
    */
-  prepareLiquidationParams(
+  async prepareLiquidationParams(
     userAddress: string,
     collateral: UserReserveData,
     debt: UserReserveData,
     priceCache: Map<string, number>,
     userHealthFactor: number = 1.0
-  ): LiquidationParams | null {
+  ): Promise<LiquidationParams | null> {
     const collateralPrice = priceCache.get(collateral.asset);
     const debtPrice = priceCache.get(debt.asset);
     if (!collateralPrice || !debtPrice) {
@@ -233,6 +243,26 @@ export class OptimizedLiquidationService {
     const debtToCoverUSD = debtToCoverFloat * debtPrice;
     const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
     logger.info(`Liquidation calc: totalDebt=${formatUnits(debt.debtBalance, debt.decimals)}, maxProtocolDebt=${formatUnits(maxProtocolDebt, debt.decimals)} (HF: ${userHealthFactor.toFixed(4)}), maxByCollateral=${maxDebtByCollateral.toFixed(4)}, final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`);
+
+    let swapPath: `0x${string}` | undefined;
+    if (this.smartRouter && collateral.asset.toLowerCase() !== debt.asset.toLowerCase()) {
+      try {
+        const estimatedCollateralAmount = BigInt(
+          Math.floor((debtToCoverUSD * liquidationBonusMultiplier / collateralPrice) * (10 ** collateral.decimals))
+        );
+        const route = await this.smartRouter.getBestRoute(
+          collateral.asset,
+          debt.asset,
+          estimatedCollateralAmount > 0n ? estimatedCollateralAmount : 1000n
+        );
+        if (route && route.path && route.path !== '0x') {
+          swapPath = route.path;
+        }
+      } catch (err: any) {
+        logger.warn(`Failed to get route from SmartRouter: ${err.message}`);
+      }
+    }
+
     return {
       userAddress,
       collateralAsset: collateral.asset,
@@ -243,6 +273,7 @@ export class OptimizedLiquidationService {
       debtToCoverUSD,
       liquidationBonus: collateral.liquidationBonus,
       estimatedValue: estimatedValueUSD,
+      swapPath,
     };
   }
   
@@ -363,7 +394,7 @@ export class OptimizedLiquidationService {
       if (!userReserves) continue;
       const bestPair = this.selectBestPair(userReserves, priceCache);
       if (!bestPair) continue;
-      const params = this.prepareLiquidationParams(
+      const params = await this.prepareLiquidationParams(
         userHealth.user,
         bestPair.collateral,
         bestPair.debt,

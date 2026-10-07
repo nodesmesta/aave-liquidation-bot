@@ -93,7 +93,8 @@ export class HealthChecker {
             status,
           });
         } else {
-          logger.warn(`Failed to check user ${userAddress}: ${result.status}`);
+          const errorMsg = result.error?.message || result.status;
+          logger.warn(`Failed to check user ${userAddress}: ${errorMsg}`);
         }
       }
     }
