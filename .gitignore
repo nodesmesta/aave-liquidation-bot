@@ -60,3 +60,11 @@ task/
 
 # VM Environment
 vm-setup/
+
+# Userpool snapshot
+userpool_snapshot.json
+
+# Unit test user individu
+test/SimulateLiquidation0x684.t.sol
+test/SimulateLiquidation0x84b.t.sol
+test/SimulateSpecificUserLiquidation.t.sol
