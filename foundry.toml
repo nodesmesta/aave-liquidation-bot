@@ -2,6 +2,8 @@
 src = "src"
 out = "artifacts"
 libs = ["node_modules", "lib"]
+optimizer = true
+optimizer_runs = 200
 remappings = [
     "@aave/=node_modules/@aave/",
     "eth-gas-reporter/=node_modules/eth-gas-reporter/",

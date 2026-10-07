@@ -160,7 +160,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
     function testSmartContractLiquidationFlow() public {
         address testUser = 0x5e1d65a8893eF15bc8AcEdFC2e90826336Eb1dAD;
         address collateralAsset = 0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf; // cbBTC
-        uint256 botCalculatedDebt = 3895634908;
+        uint256 botCalculatedDebt = 500 * 1e6; // 500 USDC
         
         vm.createSelectFork(vm.envString("BASE_RPC_URL"));
         liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2);
@@ -174,9 +174,9 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         uint256 originalPrice = oracle.getAssetPrice(collateralAsset);
         emit log_named_uint("Original cbBTC Price", originalPrice);
         
-        // Drop price by 20% to make position liquidatable
-        uint256 newPrice = (originalPrice * 80) / 100;
-        emit log_named_uint("New cbBTC Price (20% drop)", newPrice);
+        // Drop price by 80% to make position liquidatable
+        uint256 newPrice = (originalPrice * 20) / 100;
+        emit log_named_uint("New cbBTC Price (80% drop)", newPrice);
         
         // Mock oracle getAssetPrice to return lower price for cbBTC
         vm.mockCall(
@@ -199,8 +199,9 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         // Check USDC profit received by owner
         uint256 usdcBalanceBefore = IERC20(USDC).balanceOf(owner);
         
+        bytes memory swapPath = abi.encodePacked(collateralAsset, uint24(500), USDC);
         vm.prank(owner);
-        liquidator.executeLiquidation(collateralAsset, USDC, testUser, botCalculatedDebt);
+        liquidator.executeLiquidation(collateralAsset, USDC, testUser, botCalculatedDebt, swapPath);
         
         uint256 usdcBalanceAfter = IERC20(USDC).balanceOf(owner);
         uint256 profit = usdcBalanceAfter - usdcBalanceBefore;

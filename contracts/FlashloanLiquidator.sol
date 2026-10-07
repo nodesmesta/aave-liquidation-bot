@@ -18,9 +18,7 @@ interface IUniswapV3Factory {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
 }
 
-interface IUniswapV3Pool {
-    function fee() external view returns (uint24);
-}
+
 
 interface IProtocolDataProvider {
     function getReserveTokensAddresses(address asset) 
@@ -82,12 +80,12 @@ contract FlashloanLiquidator {
     }
 
     /**
-     * @notice Execute liquidation of undercollateralized position
+     * @notice Execute liquidation with legacy interface (bypass swap for same-asset positions)
      * @dev Initiates flashloan which triggers liquidation flow through executeOperation callback
      * @param collateralAsset Address of collateral asset to seize
      * @param debtAsset Address of debt asset to repay
      * @param user Address of user to liquidate
-     * @param debtToCover Amount of debt to cover 
+     * @param debtToCover Amount of debt to cover
      */
     function executeLiquidation(
         address collateralAsset,
@@ -95,7 +93,26 @@ contract FlashloanLiquidator {
         address user,
         uint256 debtToCover
     ) external onlyOwner {
-        bytes memory params = abi.encode(collateralAsset, user);
+        bytes memory params = abi.encode(collateralAsset, user, bytes(""));
+        POOL.flashLoanSimple(address(this), debtAsset, debtToCover, params, 0);
+    }
+
+    /**
+     * @notice Execute liquidation with custom Uniswap V3 swapPath (smart routing)
+     * @param collateralAsset Address of collateral asset to seize
+     * @param debtAsset Address of debt asset to repay
+     * @param user Address of user to liquidate
+     * @param debtToCover Amount of debt to cover
+     * @param swapPath Packed Uniswap V3 swap path (direct or multi-hop)
+     */
+    function executeLiquidation(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bytes calldata swapPath
+    ) external onlyOwner {
+        bytes memory params = abi.encode(collateralAsset, user, swapPath);
         POOL.flashLoanSimple(address(this), debtAsset, debtToCover, params, 0);
     }
 
@@ -118,12 +135,20 @@ contract FlashloanLiquidator {
     ) external returns (bool) {
         require(msg.sender == address(POOL), "Caller must be Pool");
         require(initiator == address(this), "Initiator must be this contract");
-        (address collateralAsset, address user) = abi.decode(params, (address, address));
-        SafeERC20.forceApprove(IERC20(asset), address(POOL), amount);
-        POOL.liquidationCall(collateralAsset, asset, user, amount, false);
-        uint256 collateralReceived = IERC20(collateralAsset).balanceOf(address(this));
+
+        address collateralAsset;
+        address user;
+        uint256 collateralReceived;
+        {
+            bytes memory swapPath;
+            (collateralAsset, user, swapPath) = abi.decode(params, (address, address, bytes));
+            SafeERC20.forceApprove(IERC20(asset), address(POOL), amount);
+            POOL.liquidationCall(collateralAsset, asset, user, amount, false);
+            collateralReceived = IERC20(collateralAsset).balanceOf(address(this));
+            _swapCollateralToDebt(collateralAsset, asset, collateralReceived, amount + premium, swapPath);
+        }
+
         uint256 amountOwed = amount + premium;
-        _swapCollateralToDebt(collateralAsset, asset, collateralReceived, amountOwed);
         SafeERC20.forceApprove(IERC20(asset), address(POOL), amountOwed);
         uint256 totalBalance = IERC20(asset).balanceOf(address(this));
         uint256 profit = totalBalance > amountOwed ? totalBalance - amountOwed : 0;
@@ -132,46 +157,6 @@ contract FlashloanLiquidator {
         }
         emit LiquidationExecuted(user, collateralAsset, asset, amount, collateralReceived, profit);
         return true;
-    }
-
-    /**
-     * @notice Execute token swap via Uniswap UniversalRouter with specific fee tier
-     * @dev External function to enable try-catch error handling in _swapCollateralToDebt
-     * @param tokenIn Address of input token
-     * @param tokenOut Address of output token
-     * @param amountIn Amount of input token to swap
-     * @param fee Uniswap V3 pool fee tier 
-     * @param minAmountOut Minimum output amount for slippage protection
-     * @return amountOut Actual amount of output token received
-     */
-    function attemptDirectSwap(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint24 fee,
-        uint256 minAmountOut
-    ) external returns (uint256 amountOut) {
-        require(msg.sender == address(this), "Only self-call");
-        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
-        SafeERC20.forceApprove(IERC20(tokenIn), PERMIT2, type(uint256).max);
-        (bool success,) = PERMIT2.call(
-            abi.encodeWithSignature(
-                "approve(address,address,uint160,uint48)",
-                tokenIn,
-                address(UNIVERSAL_ROUTER),
-                type(uint160).max,
-                type(uint48).max
-            )
-        );
-        require(success, "Permit2 approval failed");
-        bytes memory commands = abi.encodePacked(bytes1(0x00));
-        bytes memory path = abi.encodePacked(tokenIn, fee, tokenOut);
-        bytes[] memory inputs = new bytes[](1);
-        inputs[0] = abi.encode(address(this), amountIn, minAmountOut, path, true);
-        UNIVERSAL_ROUTER.execute(commands, inputs, block.timestamp);
-        uint256 balanceAfter = IERC20(tokenOut).balanceOf(address(this));
-        amountOut = balanceAfter - balanceBefore;
-        require(amountOut >= minAmountOut, "Insufficient output amount");
     }
 
     /**
@@ -225,31 +210,64 @@ contract FlashloanLiquidator {
     }
 
     /**
-     * @notice Swap collateral to debt asset using Uniswap V3 medium fee tier
-     * @dev Uses 0.3% (3000 bps) fee tier which is Uniswap's standard default
+     * @notice Execute token swap via Uniswap UniversalRouter with arbitrary packed path
+     * @param tokenIn Address of input token
+     * @param tokenOut Address of output token
+     * @param amountIn Amount of input token to swap
+     * @param swapPath Uniswap V3 packed path (1-hop or multi-hop)
+     * @param minAmountOut Minimum output amount
+     */
+    function attemptSwapWithPath(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        bytes memory swapPath,
+        uint256 minAmountOut
+    ) external returns (uint256 amountOut) {
+        require(msg.sender == address(this), "Only self-call");
+        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+        SafeERC20.forceApprove(IERC20(tokenIn), PERMIT2, type(uint256).max);
+        (bool success,) = PERMIT2.call(
+            abi.encodeWithSignature(
+                "approve(address,address,uint160,uint48)",
+                tokenIn,
+                address(UNIVERSAL_ROUTER),
+                type(uint160).max,
+                type(uint48).max
+            )
+        );
+        require(success, "Permit2 approval failed");
+        bytes memory commands = abi.encodePacked(bytes1(0x00));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(address(this), amountIn, minAmountOut, swapPath, true);
+        UNIVERSAL_ROUTER.execute(commands, inputs, block.timestamp);
+        uint256 balanceAfter = IERC20(tokenOut).balanceOf(address(this));
+        amountOut = balanceAfter - balanceBefore;
+        require(amountOut >= minAmountOut, "Insufficient output amount");
+    }
+
+    /**
+     * @notice Swap collateral to debt asset using smart routing path
+     * @dev Zero-fallback architecture delegating route discovery to off-chain SmartRouter
      * @param fromToken Collateral token address
      * @param toToken Debt token address
      * @param amount Amount of collateral to swap
      * @param minAmountOut Minimum debt asset amount needed
+     * @param swapPath Packed Uniswap V3 routing path provided by SmartRouter
      * @return amountOut Amount of debt asset received
      */
     function _swapCollateralToDebt(
         address fromToken,
         address toToken,
         uint256 amount,
-        uint256 minAmountOut
+        uint256 minAmountOut,
+        bytes memory swapPath
     ) internal returns (uint256 amountOut) {
         if (amount == 0) return 0;
         if (fromToken == toToken) return amount;
-        uint24[3] memory possibleFees = [uint24(3000), uint24(500), uint24(10000)];
-        for (uint256 i = 0; i < possibleFees.length; i++) {
-            address poolAddress = UNISWAP_FACTORY.getPool(fromToken, toToken, possibleFees[i]);
-            if (poolAddress != address(0)) {
-                uint24 poolFee = IUniswapV3Pool(poolAddress).fee();
-                return this.attemptDirectSwap(fromToken, toToken, amount, poolFee, minAmountOut);
-            }
-        }
-        revert("No Uniswap pool found");
+
+        require(swapPath.length > 0, "Empty swap path for different assets");
+        return this.attemptSwapWithPath(fromToken, toToken, amount, swapPath, minAmountOut);
     }
 
     /**
