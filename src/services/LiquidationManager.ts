@@ -23,7 +23,7 @@ export class LiquidationManager {
     private globalRpcClient: any,
     private accountAddress: string,
     private assetManager: AssetManager,
-    private onLiquidationSuccess: () => Promise<void>
+    private onLiquidationSuccess: (liquidatedUser: string) => Promise<void>
   ) {}
 
   /**
@@ -80,7 +80,7 @@ export class LiquidationManager {
           if (selection) {
             const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
             if (success) {
-               await this.onLiquidationSuccess();
+               await this.onLiquidationSuccess(selection.user.user);
                return;
             }
           }

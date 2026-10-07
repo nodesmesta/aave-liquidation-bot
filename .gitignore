@@ -3,6 +3,7 @@ dist/
 cache/
 artifacts/
 typechain-types/
+.tools/
 
 # Environment
 .env

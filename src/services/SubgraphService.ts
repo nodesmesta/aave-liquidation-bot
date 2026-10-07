@@ -31,6 +31,7 @@ export class SubgraphService {
   private client: GraphQLClient;
   private assetManager: AssetManager;
   private publicClient: any;
+  private watchedCandidates: Set<string> = new Set();
 
   constructor(subgraphUrl: string, publicClient: any, assetManager: AssetManager, apiKey?: string) {
     this.publicClient = publicClient;
@@ -42,6 +43,10 @@ export class SubgraphService {
         ...(key && { 'Authorization': `Bearer ${key}` }),
       },
     });
+  }
+
+  public getWatchedCandidates(): Set<string> {
+    return this.watchedCandidates;
   }
 
   /**
@@ -242,6 +247,7 @@ export class SubgraphService {
             const totalDebtUSD = Number(totalDebtBase) / 1e8;
             const hf = Number(healthFactor) / 1e18;
             totalValidated++;
+            const userAddr = batchAddresses[i].toLowerCase();
             if (hf < 1.075 && totalDebtUSD >= 100) {
               atRiskUsers.push({
                 address: batchAddresses[i],
@@ -249,14 +255,20 @@ export class SubgraphService {
                 collateral: totalCollateralUSD,
                 debt: totalDebtUSD,
               });
+              this.watchedCandidates.delete(userAddr);
             } else {
+              if (hf <= 1.15 && totalDebtUSD >= 100) {
+                this.watchedCandidates.add(userAddr);
+              } else {
+                this.watchedCandidates.delete(userAddr);
+              }
               filteredByHF++;
             }
           }
         }
       }
       
-      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.075 (filtered ${filteredByHF} healthy users)`);
+      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.075, ${this.watchedCandidates.size} watched candidates (1.075 <= HF <= 1.15), filtered ${filteredByHF} healthy users`);
       
       const atRiskBatches = Math.ceil(atRiskUsers.length / BATCH_SIZE);
       logger.info(`Validating assets for ${atRiskUsers.length} at-risk users (${atRiskBatches} batches)...`);

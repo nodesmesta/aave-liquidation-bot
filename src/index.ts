@@ -82,7 +82,7 @@ class LiquidatorBot {
       this.globalRpcClient,
       this.account.address,
       this.assetManager,
-      async () => { await this.restart(); }
+      async (liquidatedUser: string) => { await this.handleLiquidationSuccess(liquidatedUser); }
     );
   }
 
@@ -195,18 +195,66 @@ class LiquidatorBot {
   }
 
   /**
-   * @notice Restart bot after successful liquidation via systemd
-   * @dev Gracefully stops bot and exits process, systemd will restart
+   * @notice Handle state synchronization after successful liquidation without restart
+   * @dev Updates liquidated user status, and checks watched candidates (1.075 <= HF <= 1.15)
    */
-  async restart(): Promise<void> {
-    if (this.isRestarting) {
-      return;
+  private async handleLiquidationSuccess(liquidatedUser: string): Promise<void> {
+    logger.info(`Handling post-liquidation sync for user: ${liquidatedUser}`);
+    try {
+      // 1. Sync user yang baru saja dilikuidasi
+      const health = await this.healthChecker.checkUser(liquidatedUser);
+      if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
+        this.userPool.removeUser(liquidatedUser);
+        logger.info(`Post-liquidation: User ${liquidatedUser} removed from pool (HF: ${health.healthFactor.toFixed(4)})`);
+        if (health.healthFactor < 1.15 && health.totalDebtBase > 0n) {
+          this.subgraphService.getWatchedCandidates().add(liquidatedUser.toLowerCase());
+        }
+      } else {
+        this.userPool.updateUserHF(liquidatedUser, health.healthFactor);
+        logger.info(`Post-liquidation: User ${liquidatedUser} updated in pool (new HF: ${health.healthFactor.toFixed(4)})`);
+      }
+
+      // 2. Cek watched candidates (1.075 <= HF <= 1.15) jika ada pergerakan pasar
+      const watched = this.subgraphService.getWatchedCandidates();
+      if (watched.size > 0) {
+        const watchedList = Array.from(watched);
+        logger.info(`Checking ${watchedList.length} watched candidates (1.075 <= HF <= 1.15) for risk escalation...`);
+        const healthMap = await this.healthChecker.checkUsers(watchedList);
+        const escalatedUsers: string[] = [];
+        for (const [addr, h] of healthMap.entries()) {
+          if (h.healthFactor < 1.075 && h.totalDebtBase > 0n) {
+            escalatedUsers.push(addr);
+          } else if (h.healthFactor >= 1.15 || h.totalDebtBase === 0n) {
+            watched.delete(addr);
+          }
+        }
+
+        if (escalatedUsers.length > 0) {
+          logger.info(`Found ${escalatedUsers.length} watched candidates escalated to HF < 1.075! Ingesting...`);
+          const validationResults = await this.subgraphService.validateUsersOnChain(
+            escalatedUsers,
+            config.aave.pool,
+            config.aave.protocolDataProvider
+          );
+          for (const [address, data] of validationResults.entries()) {
+            this.userPool.addUser({
+              address: address,
+              estimatedHF: data.hf,
+              collateralUSD: data.collateral,
+              debtUSD: data.debt,
+              collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+              debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+              lastCheckedHF: data.hf,
+              lastUpdated: Date.now(),
+              addedAt: Date.now()
+            });
+          }
+          this.userPool.logStatus();
+        }
+      }
+    } catch (error) {
+      logger.error('Error during post-liquidation sync:', error);
     }
-    this.isRestarting = true;
-    logger.info('Successful liquidation - restarting via systemd for fresh state...');
-    await this.stop();
-    logger.info('Bot stopped gracefully, exiting for systemd restart...');
-    process.exit(0);
   }
 
   /**
@@ -285,6 +333,9 @@ class LiquidatorBot {
           if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
             this.userPool.removeUser(address);
             pruned++;
+            if (health.healthFactor < 1.15 && health.totalDebtBase > 0n) {
+              this.subgraphService.getWatchedCandidates().add(address.toLowerCase());
+            }
           } else {
             this.userPool.updateUserHF(address, health.healthFactor);
           }

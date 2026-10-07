@@ -100,8 +100,8 @@ npm run test         # Run tests
 | UserPool | Cache of at-risk users |
 
 **Execution Strategy:**
-- Sequential: Execute one user, restart for fresh state, process next
-- Trade-off: Lower throughput, higher reliability and safety
+- Continuous & Sequential: Execute liquidation, sync state in-memory, evaluate watched candidates without restart
+- High Reliability: Zero downtime, immediate absorption of cascading market liquidations
 - Nonce management: Simple sequential, no parallel complexity
 
 ## Configuration

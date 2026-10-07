@@ -67,7 +67,7 @@ async function main() {
     liquidationBonus: 5, // 5% bonus
   };
 
-  const params1 = liquidationService.prepareLiquidationParams(
+  const params1 = await liquidationService.prepareLiquidationParams(
     '0x1111111111111111111111111111111111111111',
     collateralReserve1,
     debtReserve1,
@@ -89,7 +89,7 @@ async function main() {
   // -------------------------------------------------------------------------
   totalTests++;
   console.log('\n[Skenario 2] User HF = 0.92 (<= 0.95) dengan Total Utang 1000 USDC...');
-  const params2 = liquidationService.prepareLiquidationParams(
+  const params2 = await liquidationService.prepareLiquidationParams(
     '0x2222222222222222222222222222222222222222',
     collateralReserve1,
     debtReserve1,
@@ -121,7 +121,7 @@ async function main() {
     liquidationBonus: 5, // 5% bonus -> $150 / 1.05 = ~$142.85 max debt
   };
 
-  const params3 = liquidationService.prepareLiquidationParams(
+  const params3 = await liquidationService.prepareLiquidationParams(
     '0x3333333333333333333333333333333333333333',
     collateralReserveLow,
     debtReserve1,
@@ -142,7 +142,7 @@ async function main() {
   // -------------------------------------------------------------------------
   totalTests++;
   console.log('\n[Skenario 4] Boundary Edge Case: User HF = 0.95 (Ambigu Threshold)...');
-  const params4 = liquidationService.prepareLiquidationParams(
+  const params4 = await liquidationService.prepareLiquidationParams(
     '0x4444444444444444444444444444444444444444',
     collateralReserve1,
     debtReserve1,
