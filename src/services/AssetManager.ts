@@ -16,7 +16,6 @@ export class AssetManager {
   private oracleAddress: Address;
 
   // Memori Penyimpanan Terpusat (Central Cache)
-  private activeAssets: string[] = []; // Daftar alamat aset aktif
   private assetConfigs: Map<string, AssetConfig> = new Map();
   private addressesToMonitor: string[] = []; // Aset yang memiliki oracle (price feed) valid
 
@@ -73,8 +72,6 @@ export class AssetManager {
       abi: this.reservesTokensAbi,
       functionName: 'getAllReservesTokens',
     }) as Array<{ symbol: string; tokenAddress: string }>;
-
-    this.activeAssets = reserves.map(r => r.tokenAddress.toLowerCase());
 
     // 2. Persiapkan pemanggilan Multicall (Batch) untuk efisiensi RPC
     const configContracts = reserves.map(r => ({

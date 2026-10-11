@@ -29,8 +29,7 @@ export class SmartRouter {
   private quoterAddress: Address;
   private assetManager?: AssetManager;
   private cache: Map<string, CachedRoute> = new Map();
-  private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-  private refreshInterval: NodeJS.Timeout | null = null;
+  private readonly CACHE_TTL_MS = 15 * 1000; // 15 seconds for short-lived on-demand deduplication
 
   constructor(
     publicClient: any,
@@ -65,13 +64,13 @@ export class SmartRouter {
     );
   }
 
-  private getCacheKey(tokenIn: string, tokenOut: string): string {
-    return `${tokenIn.toLowerCase()}_${tokenOut.toLowerCase()}`;
+  private getCacheKey(tokenIn: string, tokenOut: string, amountIn: bigint): string {
+    return `${tokenIn.toLowerCase()}_${tokenOut.toLowerCase()}_${amountIn.toString()}`;
   }
 
   /**
    * @notice Get best route with sub-millisecond in-memory cache lookup
-   * @dev Returns cached route immediately if valid (<5 min). Falls back to full quote search.
+   * @dev Returns cached route immediately if valid (<15s) with matching amountIn. Falls back to on-chain quote.
    */
   async getBestRoute(
     tokenIn: string,
@@ -89,7 +88,7 @@ export class SmartRouter {
       };
     }
 
-    const key = this.getCacheKey(tokenIn, tokenOut);
+    const key = this.getCacheKey(tokenIn, tokenOut, amountIn);
     const cached = this.cache.get(key);
     const now = Date.now();
 
@@ -213,50 +212,11 @@ export class SmartRouter {
     return best;
   }
 
-  /**
-   * @notice Pre-warm route cache for a list of token pairs
-   */
-  async prewarmRoutes(
-    pairs: Array<{ tokenIn: string; tokenOut: string; sampleAmountIn: bigint }>
-  ): Promise<void> {
-    logger.info(`SmartRouter: Pre-warming route cache for ${pairs.length} pairs...`);
-    const start = Date.now();
-    await Promise.allSettled(
-      pairs.map((p) => this.getBestRoute(p.tokenIn, p.tokenOut, p.sampleAmountIn, true))
-    );
-    logger.info(`SmartRouter: Pre-warming complete in ${Date.now() - start}ms (cached: ${this.cache.size} routes)`);
-  }
-
-  /**
-   * @notice Start background cache refresh
-   */
-  startPeriodicRefresh(
-    getPairsFn: () => Array<{ tokenIn: string; tokenOut: string; sampleAmountIn: bigint }>,
-    intervalMs: number = 5 * 60 * 1000
-  ): void {
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
-    }
-    this.refreshInterval = setInterval(async () => {
-      try {
-        const pairs = getPairsFn();
-        if (pairs.length > 0) {
-          await this.prewarmRoutes(pairs);
-        }
-      } catch (err: any) {
-        logger.error(`SmartRouter periodic refresh error: ${err.message}`);
-      }
-    }, intervalMs);
-  }
-
-  stopPeriodicRefresh(): void {
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval);
-      this.refreshInterval = null;
-    }
-  }
-
   getCacheSize(): number {
     return this.cache.size;
+  }
+
+  clearCache(): void {
+    this.cache.clear();
   }
 }

@@ -59,7 +59,8 @@ async function main() {
     collateralReserve,
     debtReserve,
     priceCache,
-    0.98
+    0.98,
+    true
   );
 
   console.log('\n--- Liquidation Params Result ---');

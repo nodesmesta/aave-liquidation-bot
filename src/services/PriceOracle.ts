@@ -1,4 +1,4 @@
-import { createPublicClient, webSocket, parseAbiItem, formatUnits, http, Chain } from 'viem';
+import { createPublicClient, webSocket, parseAbiItem, formatUnits, Chain } from 'viem';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 import { logger } from '../utils/logger';
@@ -138,7 +138,7 @@ export class PriceOracle {
     this.onPriceChangeCallback = onPriceChange;
     this.initializeWebSocketClient(wssUrl);
     await this.setupChainlinkAggregators(assets);
-    this.subscribeToChainlinkEvents(assets, onPriceChange);
+    this.subscribeToChainlinkEvents(onPriceChange);
     this.isMonitoring = true;
     logger.info(`Monitoring ${this.aggregators.size} Chainlink aggregators`);
   }
@@ -205,10 +205,9 @@ export class PriceOracle {
   /**
    * @notice Subscribe to Chainlink AnswerUpdated events via WebSocket
    * @dev Uses single WebSocket subscription with address filter for all aggregators
-   * @param assets Array of asset addresses being monitored
    * @param onPriceChange Callback function for price updates
    */
-  private subscribeToChainlinkEvents(assets: string[], onPriceChange: (updates: PriceUpdate[]) => void): void {
+  private subscribeToChainlinkEvents(onPriceChange: (updates: PriceUpdate[]) => void): void {
     const aggregatorAddresses = Array.from(this.aggregators.values()).map(agg => agg.address);
     const unsubscribe = this.wsClient!.watchEvent({
       address: aggregatorAddresses as `0x${string}`[],
@@ -278,7 +277,7 @@ export class PriceOracle {
     if (this.isMonitoring && this.onPriceChangeCallback) {
       this.unsubscribeFns.forEach(unsub => unsub());
       this.unsubscribeFns = [];
-      this.subscribeToChainlinkEvents([], this.onPriceChangeCallback);
+      this.subscribeToChainlinkEvents(this.onPriceChangeCallback);
     }
     logger.info(`[PriceOracle] Asset added: ${normalized}. Monitoring ${this.aggregators.size} assets.`);
   }
@@ -300,7 +299,7 @@ export class PriceOracle {
       this.unsubscribeFns.forEach(unsub => unsub());
       this.unsubscribeFns = [];
       if (this.aggregators.size > 0) {
-        this.subscribeToChainlinkEvents([], this.onPriceChangeCallback);
+        this.subscribeToChainlinkEvents(this.onPriceChangeCallback);
       }
     }
     logger.info(`[PriceOracle] Asset removed: ${normalized}. Monitoring ${this.aggregators.size} assets.`);

@@ -5,14 +5,13 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from './utils/logger';
 import { createAccount } from './utils/wallet';
-import { HealthChecker, UserHealth } from './services/HealthChecker';
+import { HealthChecker } from './services/HealthChecker';
 import { LiquidationExecutor } from './services/LiquidationExecutor';
-import { PriceOracle, PriceUpdate } from './services/PriceOracle';
+import { PriceOracle } from './services/PriceOracle';
 import { SubgraphService } from './services/SubgraphService';
 import { OptimizedLiquidationService } from './services/OptimizedLiquidationService';
 import { UserPool } from './services/UserPool';
 import { AssetManager } from './services/AssetManager';
-import { LiquidationParams } from './services/OptimizedLiquidationService';
 import { LiquidationManager } from './services/LiquidationManager';
 import { SmartRouter } from './services/SmartRouter';
 
@@ -128,25 +127,6 @@ class LiquidatorBot {
         });
       }
       this.userPool.logStatus();
-
-      // Pre-warm SmartRouter route cache for active user collateral/debt pairs
-      const uniquePairs = new Map<string, { tokenIn: string; tokenOut: string; sampleAmountIn: bigint }>();
-      for (const [, data] of validationResults.entries()) {
-        for (const c of data.collateralAssets) {
-          for (const d of data.debtAssets) {
-            if (c.toLowerCase() !== d.toLowerCase()) {
-              const pairKey = `${c.toLowerCase()}_${d.toLowerCase()}`;
-              if (!uniquePairs.has(pairKey)) {
-                uniquePairs.set(pairKey, { tokenIn: c, tokenOut: d, sampleAmountIn: 1000000n });
-              }
-            }
-          }
-        }
-      }
-      if (uniquePairs.size > 0) {
-        await this.smartRouter.prewarmRoutes(Array.from(uniquePairs.values()));
-        this.smartRouter.startPeriodicRefresh(() => Array.from(uniquePairs.values()), 5 * 60 * 1000);
-      }
 
       this.isInitialized = true;
       logger.info('Initialization complete');

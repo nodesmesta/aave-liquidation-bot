@@ -14,7 +14,7 @@ const consoleFormat = winston.format.combine(
   winston.format.printf(({ timestamp, level, message, ...meta }) => {
     let msg = `${timestamp} [${level}]: ${message}`;
     if (Object.keys(meta).length > 0) {
-      msg += ` ${JSON.stringify(meta, (key, value) => 
+      msg += ` ${JSON.stringify(meta, (_key, value) => 
         typeof value === 'bigint' ? value.toString() : value
       )}`;
     }

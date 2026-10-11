@@ -54,52 +54,86 @@ export class LiquidationManager {
         logger.info(`${assetSymbol} ${direction}${Math.abs(update.percentChange).toFixed(2)}% ($${update.oldPrice.toFixed(2)}→$${update.newPrice.toFixed(2)}) affects ${totalAffected} users (${highRiskCount} high-risk)`);
       }
     }
-    if (!this.isCheckingUsers && highRiskUsers.size > 0) {
+    if (!this.isCheckingUsers && allAffectedUsers.size > 0) {
       this.checkHighRiskThenUpdateCache(Array.from(highRiskUsers), Array.from(allAffectedUsers));
     }
   }
 
   /**
-   * @notice Check high-risk users first, execute if liquidatable, otherwise update cache for all affected
+   * @notice Check high-risk users first, execute if liquidatable, otherwise check and update cache for all affected
    */
   private async checkHighRiskThenUpdateCache(highRiskUsers: string[], allAffectedUsers: string[]): Promise<void> {
     if (this.isCheckingUsers) return;
     this.isCheckingUsers = true;
     try {
       const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
-      logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (elapsed: ${elapsedSincePriceUpdate}ms)`);
-      const highRiskCheckStart = Date.now();
-      const highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
-      const highRiskCheckLatency = Date.now() - highRiskCheckStart;
-      const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
-      if (liquidatable.length > 0) {
-        logger.info(`Found ${liquidatable.length} liquidatable (check: ${highRiskCheckLatency}ms)`);
-        const availableUsers = liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
+
+      // Phase 1: Prioritize high-risk users (HF <= 1.03) if any exist
+      if (highRiskUsers.length > 0) {
+        logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (elapsed: ${elapsedSincePriceUpdate}ms)`);
+        const highRiskCheckStart = Date.now();
+        const highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
+        const highRiskCheckLatency = Date.now() - highRiskCheckStart;
+        const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
+        if (liquidatable.length > 0) {
+          logger.info(`Phase 1: Found ${liquidatable.length} liquidatable (check: ${highRiskCheckLatency}ms)`);
+          const availableUsers = liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
+          if (availableUsers.length > 0) {
+            const selection = await this.selectBestLiquidation(availableUsers);
+            if (selection) {
+              const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
+              if (success) {
+                await this.onLiquidationSuccess(selection.user.user);
+                return;
+              }
+            }
+          }
+        }
+      } else {
+        logger.info(`Phase 1: 0 high-risk users (HF<=1.03). Evaluating all ${allAffectedUsers.length} affected users on-chain.`);
+      }
+
+      // Phase 2: Check all affected users, liquidate if any dropped below 1.0, and update userPool cache
+      const phase2Label = highRiskUsers.length > 0
+        ? `Phase 2: Updating cache and checking remaining ${allAffectedUsers.length} affected users`
+        : `Phase 2: Evaluating and syncing ${allAffectedUsers.length} affected users`;
+      logger.info(phase2Label);
+
+      const cacheUpdateStart = Date.now();
+      const allHealthMap = await this.healthChecker.checkUsers(allAffectedUsers);
+      const cacheUpdateLatency = Date.now() - cacheUpdateStart;
+
+      // Check if any user in Phase 2 escalated to liquidatable (HF < 1.0)
+      const phase2Liquidatable = this.healthChecker.filterLiquidatable(allHealthMap);
+      if (phase2Liquidatable.length > 0) {
+        const availableUsers = phase2Liquidatable.filter(userHealth => !this.inFlightLiquidations.has(userHealth.user));
         if (availableUsers.length > 0) {
+          logger.info(`Phase 2: Found ${availableUsers.length} liquidatable user(s) escalated from affected pool!`);
           const selection = await this.selectBestLiquidation(availableUsers);
           if (selection) {
             const success = await this.executeLiquidationWithParams(selection.user, selection.params, selection.gasSettings);
             if (success) {
-               await this.onLiquidationSuccess(selection.user.user);
-               return;
+              await this.onLiquidationSuccess(selection.user.user);
             }
           }
         }
       }
-      logger.info(`Phase 2: No liquidatable positions found, updating cache for ${allAffectedUsers.length} affected users`);
-      const cacheUpdateStart = Date.now();
-      const allHealthMap = await this.healthChecker.checkUsers(allAffectedUsers);
-      const cacheUpdateLatency = Date.now() - cacheUpdateStart;
+
+      // Update UserPool cache: record updated HF (so users reaching <=1.03 are properly stored) and prune safe users
       let removedCount = 0;
+      let newlyHighRiskCount = 0;
       for (const [address, health] of allHealthMap.entries()) {
-        if (health.healthFactor >= 1.1) {
+        if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
           this.userPool.removeUser(address);
           removedCount++;
         } else {
           this.userPool.updateUserHF(address, health.healthFactor);
+          if (health.healthFactor <= 1.03) {
+            newlyHighRiskCount++;
+          }
         }
       }
-      logger.info(`Cache updated (${removedCount} removed, ${cacheUpdateLatency}ms)`);
+      logger.info(`Cache updated: ${allAffectedUsers.length} users checked (${removedCount} removed, ${newlyHighRiskCount} now HF<=1.03, ${cacheUpdateLatency}ms)`);
     } catch (error) {
       logger.error('Error in two-phase health check:', error);
     } finally {
@@ -159,6 +193,10 @@ export class LiquidationManager {
         const skip = skippedCount > 0 ? ` (skipped ${skippedCount})` : '';
         const netStr = gasResult.netProfitUSD !== undefined ? ` netProfit:$${gasResult.netProfitUSD.toFixed(2)}` : '';
         logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH ($${(gasResult.maxGasCostUSD || 0).toFixed(2)})${netStr} (${paramsLatency}ms)`);
+        
+        // Resolve Uniswap V3 route ONLY for this single selected pair right before execution
+        await this.optimizedLiquidation.attachSwapRoute(liq.params);
+
         return { user: liq.userHealth, params: liq.params, gasSettings: gasResult.gasSettings };
       } else {
         skippedCount++;

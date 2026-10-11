@@ -27,6 +27,7 @@ export interface LiquidationParams {
   debtToCoverUSD: number;
   liquidationBonus: number;
   estimatedValue: number;
+  estimatedCollateralAmount?: bigint;
   swapPath?: `0x${string}`;
 }
 
@@ -49,25 +50,6 @@ export class OptimizedLiquidationService {
   private poolAbi = parseAbi([
     'function getUserConfiguration(address user) external view returns (uint256)',
   ]);
-
-  private reservesTokensAbi = [
-    {
-      name: 'getAllReservesTokens',
-      type: 'function',
-      stateMutability: 'view',
-      inputs: [],
-      outputs: [
-        {
-          name: '',
-          type: 'tuple[]',
-          components: [
-            { name: 'symbol', type: 'string' },
-            { name: 'tokenAddress', type: 'address' }
-          ]
-        }
-      ]
-    }
-  ] as const;
 
 
   private assetManager: AssetManager;
@@ -183,7 +165,8 @@ export class OptimizedLiquidationService {
     collateral: UserReserveData,
     debt: UserReserveData,
     priceCache: Map<string, number>,
-    userHealthFactor: number = 1.0
+    userHealthFactor: number = 1.0,
+    resolveRoute: boolean = false
   ): Promise<LiquidationParams | null> {
     const collateralPrice = priceCache.get(collateral.asset);
     const debtPrice = priceCache.get(debt.asset);
@@ -244,26 +227,11 @@ export class OptimizedLiquidationService {
     const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
     logger.info(`Liquidation calc: totalDebt=${formatUnits(debt.debtBalance, debt.decimals)}, maxProtocolDebt=${formatUnits(maxProtocolDebt, debt.decimals)} (HF: ${userHealthFactor.toFixed(4)}), maxByCollateral=${maxDebtByCollateral.toFixed(4)}, final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`);
 
-    let swapPath: `0x${string}` | undefined;
-    if (this.smartRouter && collateral.asset.toLowerCase() !== debt.asset.toLowerCase()) {
-      try {
-        const estimatedCollateralAmount = BigInt(
-          Math.floor((debtToCoverUSD * liquidationBonusMultiplier / collateralPrice) * (10 ** collateral.decimals))
-        );
-        const route = await this.smartRouter.getBestRoute(
-          collateral.asset,
-          debt.asset,
-          estimatedCollateralAmount > 0n ? estimatedCollateralAmount : 1000n
-        );
-        if (route && route.path && route.path !== '0x') {
-          swapPath = route.path;
-        }
-      } catch (err: any) {
-        logger.warn(`Failed to get route from SmartRouter: ${err.message}`);
-      }
-    }
+    const estimatedCollateralAmount = BigInt(
+      Math.floor((debtToCoverUSD * liquidationBonusMultiplier / collateralPrice) * (10 ** collateral.decimals))
+    );
 
-    return {
+    const params: LiquidationParams = {
       userAddress,
       collateralAsset: collateral.asset,
       collateralSymbol: collateral.symbol,
@@ -273,8 +241,51 @@ export class OptimizedLiquidationService {
       debtToCoverUSD,
       liquidationBonus: collateral.liquidationBonus,
       estimatedValue: estimatedValueUSD,
-      swapPath,
+      estimatedCollateralAmount,
     };
+
+    if (resolveRoute) {
+      await this.attachSwapRoute(params);
+    }
+
+    return params;
+  }
+
+  /**
+   * @notice Attach Uniswap V3 swap path to the liquidation parameters on-demand
+   * @dev Called ONLY for the single chosen liquidation pair right before execution
+   */
+  async attachSwapRoute(params: LiquidationParams): Promise<LiquidationParams> {
+    if (params.collateralAsset.toLowerCase() === params.debtAsset.toLowerCase()) {
+      params.swapPath = '0x';
+      return params;
+    }
+
+    if (!this.smartRouter) {
+      return params;
+    }
+
+    try {
+      const amountToSwap = (params.estimatedCollateralAmount && params.estimatedCollateralAmount > 0n)
+        ? params.estimatedCollateralAmount
+        : 1000n;
+
+      const route = await this.smartRouter.getBestRoute(
+        params.collateralAsset,
+        params.debtAsset,
+        amountToSwap
+      );
+
+      if (route && route.path && route.path !== '0x') {
+        params.swapPath = route.path;
+      }
+    } catch (err: any) {
+      logger.warn(
+        `Failed to get route from SmartRouter for ${params.collateralSymbol} -> ${params.debtSymbol}: ${err.message}`
+      );
+    }
+
+    return params;
   }
   
   /**

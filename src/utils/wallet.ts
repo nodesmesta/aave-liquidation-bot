@@ -1,5 +1,5 @@
-import { createWalletClient as viemCreateWalletClient, http, Chain } from 'viem';
-import { privateKeyToAccount, mnemonicToAccount, PrivateKeyAccount } from 'viem/accounts';
+import { createWalletClient as viemCreateWalletClient, http } from 'viem';
+import { privateKeyToAccount, mnemonicToAccount } from 'viem/accounts';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
 
