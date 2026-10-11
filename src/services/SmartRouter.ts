@@ -27,12 +27,16 @@ export class SmartRouter {
 
   private publicClient: PublicClient;
   private quoterAddress: Address;
-  private assetManager: AssetManager;
+  private assetManager?: AssetManager;
   private cache: Map<string, CachedRoute> = new Map();
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
   private refreshInterval: NodeJS.Timeout | null = null;
 
-  constructor(publicClient: any, quoterAddress: Address, assetManager: AssetManager) {
+  constructor(
+    publicClient: any,
+    quoterAddress: Address = '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+    assetManager?: AssetManager
+  ) {
     this.publicClient = publicClient;
     this.quoterAddress = quoterAddress;
     this.assetManager = assetManager;
@@ -125,8 +129,8 @@ export class SmartRouter {
       });
     }
 
-    // 2. Multi-hop paths (via dynamic hubs from AssetManager)
-    const hubs = this.assetManager.getRoutingHubs();
+    // 2. Multi-hop paths (via dynamic hubs from AssetManager if available)
+    const hubs = this.assetManager ? this.assetManager.getRoutingHubs() : [];
     for (const hub of hubs) {
       if (hub.toLowerCase() === tokenIn.toLowerCase() || hub.toLowerCase() === tokenOut.toLowerCase()) {
         continue;
@@ -143,34 +147,55 @@ export class SmartRouter {
       }
     }
 
-    // Quote all candidate paths concurrently
-    const quotePromises = candidatePaths.map(async (candidate) => {
-      try {
-        const result = await this.publicClient.readContract({
-          address: this.quoterAddress,
-          abi: this.quoterAbi,
-          functionName: 'quoteExactInput',
-          args: [candidate.path, amountIn],
-        });
-
-        const [amountOut, , , gasEstimate] = result as [bigint, readonly bigint[], readonly number[], bigint];
-        if (amountOut > 0n) {
-          return {
-            path: candidate.path,
-            amountOut,
-            hops: candidate.hops,
-            gasEstimate,
-            description: candidate.desc,
-          } as RouteQuote;
-        }
-      } catch {
-        // Pool does not exist or has insufficient liquidity; expected for invalid routes
-      }
+    if (candidatePaths.length === 0) {
       return null;
-    });
+    }
 
-    const results = await Promise.all(quotePromises);
-    const validQuotes = results.filter((q): q is RouteQuote => q !== null);
+    // Quote candidate paths using Multicall3 with allowFailure: true
+    const validQuotes: RouteQuote[] = [];
+    const BATCH_SIZE = 50;
+
+    for (let i = 0; i < candidatePaths.length; i += BATCH_SIZE) {
+      const batchCandidates = candidatePaths.slice(i, i + BATCH_SIZE);
+      const contracts = batchCandidates.map((candidate) => ({
+        address: this.quoterAddress,
+        abi: this.quoterAbi,
+        functionName: 'quoteExactInput',
+        args: [candidate.path, amountIn],
+      }));
+
+      try {
+        const batchResults = (await this.publicClient.multicall({
+          contracts,
+          allowFailure: true,
+        })) as Array<{ status: 'success' | 'failure'; result?: unknown; error?: Error }>;
+
+        for (let j = 0; j < batchResults.length; j++) {
+          const res = batchResults[j];
+          if (res.status === 'success' && res.result) {
+            const [amountOut, , , gasEstimate] = res.result as [
+              bigint,
+              readonly bigint[],
+              readonly number[],
+              bigint
+            ];
+            if (amountOut > 0n) {
+              validQuotes.push({
+                path: batchCandidates[j].path,
+                amountOut,
+                hops: batchCandidates[j].hops,
+                gasEstimate,
+                description: batchCandidates[j].desc,
+              });
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.warn(
+          `SmartRouter multicall batch error for ${tokenIn} -> ${tokenOut}: ${err.message}`
+        );
+      }
+    }
 
     if (validQuotes.length === 0) {
       logger.warn(`No valid Uniswap V3 route found for ${tokenIn} -> ${tokenOut}`);

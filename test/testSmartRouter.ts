@@ -1,6 +1,8 @@
 import { createPublicClient, http } from 'viem';
 import { base } from 'viem/chains';
 import { SmartRouter } from '../src/services/SmartRouter';
+import { AssetManager } from '../src/services/AssetManager';
+import { config } from '../src/config';
 import * as dotenv from 'dotenv';
 dotenv.config();
 
@@ -11,7 +13,10 @@ async function main() {
     transport: http(rpcUrl),
   });
 
-  const router = new SmartRouter(client);
+  const assetManager = new AssetManager(client, config.aave.protocolDataProvider);
+  await assetManager.initialize();
+
+  const router = new SmartRouter(client, config.uniswap.quoterV2, assetManager);
 
   const CBBTC = '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf';
   const WEETH = '0x04C0599Ae5A44757c0af6F9eC3b93da8976c150A';

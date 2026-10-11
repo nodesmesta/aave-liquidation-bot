@@ -17,7 +17,7 @@ async function main() {
   const assetManager = new AssetManager(client, config.aave.protocolDataProvider);
   await assetManager.initialize();
 
-  const smartRouter = new SmartRouter(client);
+  const smartRouter = new SmartRouter(client, config.uniswap.quoterV2, assetManager);
   const liquidationService = new OptimizedLiquidationService(
     client,
     config.aave.protocolDataProvider,
