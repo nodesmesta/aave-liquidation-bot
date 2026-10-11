@@ -54,7 +54,8 @@ contract Simulate3UsersAutomatedTest is Test, BaseTestConfig {
             UNIVERSAL_ROUTER,
             DATA_PROVIDER,
             UNISWAP_FACTORY,
-            PERMIT2
+            PERMIT2,
+            owner
         );
     }
 

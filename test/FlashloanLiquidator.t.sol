@@ -54,7 +54,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         user = makeAddr("user");
         pool = IPool(POOL_ADDRESS);
         dataProvider = IProtocolDataProvider(DATA_PROVIDER);
-        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2);
+        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2, owner);
     }
 
     function testDeployment() public view {
@@ -94,7 +94,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
     function testRealLiquidationCase() public {
         RealLiquidationCase memory liqCase = getLiquidationCase1();
         vm.createSelectFork(vm.envString("BASE_RPC_URL"), liqCase.blockNumber);
-        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2);
+        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2, owner);
         (, , , , , uint256 healthFactor) = pool.getUserAccountData(liqCase.user);
         if (!isLiquidatable(healthFactor)) {
             return;
@@ -114,7 +114,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
     function testUserCase2() public {
         RealLiquidationCase memory liqCase = getLiquidationCase2();
         vm.createSelectFork(vm.envString("BASE_RPC_URL"));
-        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2);
+        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2, owner);
         (uint256 totalCollateral, uint256 totalDebt, , , , uint256 healthFactor) = pool.getUserAccountData(liqCase.user);
         
         emit log_named_uint("Total Collateral (USD)", totalCollateral);
@@ -163,7 +163,7 @@ contract FlashloanLiquidatorTest is Test, BaseTestConfig {
         uint256 botCalculatedDebt = 500 * 1e6; // 500 USDC
         
         vm.createSelectFork(vm.envString("BASE_RPC_URL"));
-        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2);
+        liquidator = new FlashloanLiquidator(POOL_ADDRESSES_PROVIDER, UNIVERSAL_ROUTER, DATA_PROVIDER, UNISWAP_FACTORY, PERMIT2, owner);
         
         // Get current health factor
         (, , , , , uint256 hfBefore) = pool.getUserAccountData(testUser);

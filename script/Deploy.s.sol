@@ -11,14 +11,20 @@ contract DeployScript is Script {
     address constant UNISWAP_FACTORY = 0x33128a8fC17869897dcE68Ed026d694621f6FDfD;
     address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
     
+    address constant OWNER = 0x04898c077Eb5f6e3Dc5F6086Cd96CeeED523Cd81;
+
+    // Salt to produce vanity address with 6 leading zeros: 0x00000032fa2f481f41Db0c61a3eb5DDA86178E06
+    bytes32 constant SALT = 0x6a511d341ec619ab0d83874926ecc3610dbd81d2b08d05f4b153fc59e2892d55;
+    
     function run() external {
         vm.startBroadcast();
-        FlashloanLiquidator liquidator = new FlashloanLiquidator(
+        FlashloanLiquidator liquidator = new FlashloanLiquidator{salt: SALT}(
             POOL_ADDRESSES_PROVIDER,
             UNIVERSAL_ROUTER,
             DATA_PROVIDER,
             UNISWAP_FACTORY,
-            PERMIT2
+            PERMIT2,
+            OWNER
         );
         vm.stopBroadcast();
     }

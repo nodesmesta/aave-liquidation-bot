@@ -18,8 +18,6 @@ interface IUniswapV3Factory {
     function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
 }
 
-
-
 interface IProtocolDataProvider {
     function getReserveTokensAddresses(address asset) 
         external 
@@ -68,15 +66,24 @@ contract FlashloanLiquidator {
      * @param _dataProvider Aave V3 ProtocolDataProvider address
      * @param _uniswapFactory Uniswap V3 Factory address
      * @param _permit2 Permit2 contract address
+     * @param _owner Initial owner address
      */
-    constructor(address _addressProvider, address _universalRouter, address _dataProvider, address _uniswapFactory, address _permit2) {
+    constructor(
+        address _addressProvider,
+        address _universalRouter,
+        address _dataProvider,
+        address _uniswapFactory,
+        address _permit2,
+        address _owner
+    ) {
+        require(_owner != address(0), "Zero owner address");
         ADDRESSES_PROVIDER = IPoolAddressesProvider(_addressProvider);
         POOL = IPool(ADDRESSES_PROVIDER.getPool());
         UNIVERSAL_ROUTER = IUniversalRouter(_universalRouter);
         DATA_PROVIDER = IProtocolDataProvider(_dataProvider);
         UNISWAP_FACTORY = IUniswapV3Factory(_uniswapFactory);
         PERMIT2 = _permit2;
-        owner = msg.sender;
+        owner = _owner;
     }
 
     /**
