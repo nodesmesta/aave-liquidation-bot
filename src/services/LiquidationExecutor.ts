@@ -260,7 +260,7 @@ export class LiquidationExecutor {
           error: 'Transaction confirmation timeout',
         };
       }
-      if (receipt.status === 0) {
+      if (receipt.status !== 'success') {
         logger.error(`Transaction reverted: ${receipt.transactionHash}`);
         this.recordFailure();
         return { success: false, error: 'Transaction reverted', txHash: receipt.transactionHash };
@@ -301,7 +301,7 @@ export class LiquidationExecutor {
     });
     const receipt = await this.pollTransactionConfirmation(hash);
     if (!receipt) throw new Error(`Failed to confirm ownership transfer for TX: ${hash}`);
-    if (receipt.status === 0) {
+    if (receipt.status !== 'success') {
       throw new Error(`Ownership transfer transaction reverted: ${receipt.transactionHash}`);
     }
     logger.info(`Ownership transferred! TX: ${receipt.transactionHash}`);

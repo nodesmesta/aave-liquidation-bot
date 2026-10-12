@@ -1,5 +1,5 @@
-import { createPublicClient, http, formatEther, Chain } from 'viem';
-import { basePreconf } from 'viem/chains';
+import { createPublicClient, http, formatEther } from 'viem';
+import { base, basePreconf } from 'viem/chains';
 import { config, validateConfig } from './config';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -33,15 +33,8 @@ class LiquidatorBot {
   private liquidationManager: LiquidationManager;
 
   constructor() {
-    const customChain: Chain = {
-      ...basePreconf,
-      rpcUrls: {
-        ...basePreconf.rpcUrls,
-        default: { http: [config.network.rpcUrl] },
-      },
-    } as Chain;
     this.globalRpcClient = createPublicClient({
-      chain: customChain,
+      chain: base,
       transport: http(config.network.rpcUrl),
     });
     this.globalPreconfClient = createPublicClient({
@@ -262,8 +255,8 @@ class LiquidatorBot {
     const blockNumber = await this.globalRpcClient.getBlockNumber();
     const balance = await this.globalRpcClient.getBalance({ address: this.account.address });
     logger.info(`Connected: Base chain ${chainId}, block ${blockNumber}, balance ${formatEther(balance)} ETH`);
-    if (Number(chainId) !== basePreconf.id) {
-      throw new Error(`Wrong network! Expected ${basePreconf.id}, got ${chainId}`);
+    if (Number(chainId) !== base.id) {
+      throw new Error(`Wrong network! Expected ${base.id}, got ${chainId}`);
     }
   }
 
