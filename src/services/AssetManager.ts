@@ -1,4 +1,5 @@
-import { Address, PublicClient, parseAbi } from 'viem';
+import { Address, PublicClient, parseAbi, createPublicClient, webSocket } from 'viem';
+import { base } from 'viem/chains';
 import { AaveV3Base } from '@bgd-labs/aave-address-book';
 import { logger } from '../utils/logger';
 import { config } from '../config';
@@ -12,6 +13,7 @@ export interface AssetConfig {
 
 export class AssetManager {
   private publicClient: PublicClient;
+  private wsClient: any = null;
   private protocolDataProvider: Address;
   private oracleAddress: Address;
 
@@ -53,10 +55,13 @@ export class AssetManager {
     'event CollateralConfigurationChanged(address indexed asset, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus)'
   ]);
 
-  constructor(publicClient: any, protocolDataProvider: string) {
+  constructor(publicClient: any, protocolDataProvider: string, wsClient?: any) {
     this.publicClient = publicClient;
     this.protocolDataProvider = protocolDataProvider as Address;
     this.oracleAddress = config.aave.oracle as Address;
+    if (wsClient) {
+      this.wsClient = wsClient;
+    }
   }
 
   /**
@@ -171,19 +176,35 @@ export class AssetManager {
   }
 
   /**
-   * @notice Mengaktifkan event listener pada kontrak Aave PoolConfigurator.
-   * @dev Fungsi ini akan memantau perubahan status aset secara real-time dari blockchain.
+   * @notice Mengaktifkan event listener pada kontrak Aave PoolConfigurator via WebSocket.
+   * @dev Menggunakan WebSocket untuk event streaming real-time tanpa HTTP RPC polling.
    * @param priceOracle Referensi PriceOracle untuk sinkronisasi subscription harga otomatis.
+   * @param customWsClient Opsional instance PublicClient dengan WebSocket transport.
    */
-  public startEventListening(priceOracle?: PriceOracle): void {
-    logger.info('Starting Aave PoolConfigurator Event Listener...');
+  public startEventListening(priceOracle?: PriceOracle, customWsClient?: any): void {
+    if (customWsClient) {
+      this.wsClient = customWsClient;
+    } else if (!this.wsClient && config.network.wssUrl) {
+      this.wsClient = createPublicClient({
+        chain: base,
+        transport: webSocket(config.network.wssUrl, {
+          keepAlive: true,
+          reconnect: true,
+        }),
+      });
+      logger.info('AssetManager: WebSocket client initialized');
+    }
+
+    const clientToUse = this.wsClient || this.publicClient;
+    const transportType = this.wsClient ? 'WebSocket' : 'HTTP (fallback)';
+    logger.info(`Starting Aave PoolConfigurator Event Listener via ${transportType}...`);
 
     // 1. ReserveInitialized (Saat koin baru didaftarkan ke Aave)
-    this.publicClient.watchContractEvent({
+    clientToUse.watchContractEvent({
       address: AaveV3Base.POOL_CONFIGURATOR as Address,
       abi: this.configuratorEventsAbi,
       eventName: 'ReserveInitialized',
-      onLogs: async (logs) => {
+      onLogs: async (logs: any[]) => {
         for (const log of logs) {
           const assetAddress = log.args.asset;
           if (assetAddress) {
@@ -193,15 +214,18 @@ export class AssetManager {
             await priceOracle?.addAsset(assetAddress.toLowerCase());
           }
         }
+      },
+      onError: (error: any) => {
+        logger.error(`AssetManager WebSocket error (ReserveInitialized): ${error?.message || error}`);
       }
     });
 
     // 2. ReservePaused (Saat fitur borrow/collateral koin dibekukan Aave)
-    this.publicClient.watchContractEvent({
+    clientToUse.watchContractEvent({
       address: AaveV3Base.POOL_CONFIGURATOR as Address,
       abi: this.configuratorEventsAbi,
       eventName: 'ReservePaused',
-      onLogs: async (logs) => {
+      onLogs: async (logs: any[]) => {
         for (const log of logs) {
           const assetAddress = log.args.asset?.toLowerCase();
           const isPaused = log.args.isPaused;
@@ -217,16 +241,19 @@ export class AssetManager {
             await priceOracle?.addAsset(assetAddress);
           }
         }
+      },
+      onError: (error: any) => {
+        logger.error(`AssetManager WebSocket error (ReservePaused): ${error?.message || error}`);
       }
     });
 
     // 3. CollateralConfigurationChanged (Saat Aave mengubah angka Liquidation Bonus / LTV)
     // Tidak ada interaksi dengan PriceOracle karena event ini hanya mengubah parameter kalkulasi.
-    this.publicClient.watchContractEvent({
+    clientToUse.watchContractEvent({
       address: AaveV3Base.POOL_CONFIGURATOR as Address,
       abi: this.configuratorEventsAbi,
       eventName: 'CollateralConfigurationChanged',
-      onLogs: (logs) => {
+      onLogs: (logs: any[]) => {
         for (const log of logs) {
           const assetAddress = log.args.asset?.toLowerCase();
           const liquidationBonusRaw = Number(log.args.liquidationBonus);
@@ -243,6 +270,9 @@ export class AssetManager {
             }
           }
         }
+      },
+      onError: (error: any) => {
+        logger.error(`AssetManager WebSocket error (CollateralConfigurationChanged): ${error?.message || error}`);
       }
     });
   }

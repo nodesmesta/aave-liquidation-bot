@@ -154,18 +154,6 @@ class LiquidatorBot {
     logger.info('Bot started - monitoring for opportunities');
   }
 
-  /**
-   * @notice Stop liquidation bot
-   * @dev Clears state, stops monitoring, logs final stats
-   */
-  async stop(): Promise<void> {
-    logger.info('Stopping Liquidator Bot...');
-    this.isPriceMonitoring = false;
-    this.isInitialized = false;
-    this.priceOracle.stopPriceMonitoring();
-    logger.info('Final Statistics:', this.executor.getStats());
-    logger.info('Bot stopped');
-  }
 
   /**
    * @notice Handle state synchronization after successful liquidation without restart
@@ -239,9 +227,7 @@ class LiquidatorBot {
       return;
     }
     this.isRestarting = true;
-    logger.error('Fatal error detected - restarting via systemd...');
-    await this.stop();
-    logger.info('Bot stopped gracefully, exiting for systemd restart...');
+    logger.error('Fatal error detected - exiting for systemd restart...');
     process.exit(1);
   }
 
@@ -387,14 +373,12 @@ class LiquidatorBot {
 
 async function main() {
   const bot = new LiquidatorBot();
-  process.on('SIGINT', async () => {
-    logger.info('Received SIGINT signal');
-    await bot.stop();
+  process.on('SIGINT', () => {
+    logger.info('Received SIGINT signal, exiting...');
     process.exit(0);
   });
-  process.on('SIGTERM', async () => {
-    logger.info('Received SIGTERM signal');
-    await bot.stop();
+  process.on('SIGTERM', () => {
+    logger.info('Received SIGTERM signal, exiting...');
     process.exit(0);
   });
   await bot.start();
