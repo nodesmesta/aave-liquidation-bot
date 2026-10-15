@@ -14,6 +14,7 @@ export interface PriceUpdate {
 interface ChainlinkAggregator {
   address: `0x${string}`;
   decimals: number;
+  isDualAggregator: boolean;
 }
 
 export class PriceOracle {
@@ -22,10 +23,13 @@ export class PriceOracle {
   private lastPrices: Map<string, number> = new Map();
   private isMonitoring = false;
   private aggregators: Map<string, ChainlinkAggregator> = new Map();
+  private aggregatorToAssets: Map<string, Array<{ asset: string; decimals: number; isDualAggregator: boolean }>> = new Map();
+  private roundPrices: Map<string, number> = new Map();
   private unsubscribeFns: (() => void)[] = [];
   private onFatalError: (() => void) | null = null;
   private onPriceChangeCallback: ((updates: PriceUpdate[]) => void) | null = null;
   private readonly AAVE_ORACLE: `0x${string}`;
+
   private ORACLE_ABI = [
     {
       inputs: [{ name: 'assets', type: 'address[]' }],
@@ -42,6 +46,7 @@ export class PriceOracle {
       type: 'function',
     },
   ] as const;
+
   private CHAINLINK_ABI = [
     {
       anonymous: false,
@@ -51,6 +56,14 @@ export class PriceOracle {
         { indexed: false, name: 'updatedAt', type: 'uint256' },
       ],
       name: 'AnswerUpdated',
+      type: 'event',
+    },
+    {
+      anonymous: false,
+      inputs: [
+        { indexed: true, name: 'secondaryRoundId', type: 'uint32' },
+      ],
+      name: 'SecondaryRoundIdUpdated',
       type: 'event',
     },
     {
@@ -64,6 +77,26 @@ export class PriceOracle {
       inputs: [],
       name: 'aggregator',
       outputs: [{ name: '', type: 'address' }],
+      stateMutability: 'view',
+      type: 'function',
+    },
+    {
+      inputs: [{ name: '_roundId', type: 'uint80' }],
+      name: 'getRoundData',
+      outputs: [
+        { name: 'roundId', type: 'uint80' },
+        { name: 'answer', type: 'int256' },
+        { name: 'startedAt', type: 'uint256' },
+        { name: 'updatedAt', type: 'uint256' },
+        { name: 'answeredInRound', type: 'uint80' },
+      ],
+      stateMutability: 'view',
+      type: 'function',
+    },
+    {
+      inputs: [],
+      name: 'typeAndVersion',
+      outputs: [{ name: '', type: 'string' }],
       stateMutability: 'view',
       type: 'function',
     },
@@ -113,7 +146,7 @@ export class PriceOracle {
     const priceMap = new Map<string, number>();
     assetAddresses.forEach((asset, index) => {
       const price = parseFloat(formatUnits(prices[index], 8));
-      priceMap.set(asset, price);
+      priceMap.set(asset.toLowerCase(), price);
     });
     return priceMap;
   }
@@ -128,8 +161,24 @@ export class PriceOracle {
   }
 
   /**
+   * @notice Seed initial prices from Aave Oracle for baseline tracking
+   * @param assets Array of asset addresses
+   */
+  private async seedInitialPrices(assets: string[]): Promise<void> {
+    try {
+      const priceMap = await this.getAssetsPrices(assets);
+      for (const [asset, price] of priceMap.entries()) {
+        this.lastPrices.set(asset.toLowerCase(), price);
+      }
+      logger.info(`Seeded initial prices for ${priceMap.size} assets`);
+    } catch (error) {
+      logger.warn('Failed to seed initial prices from Aave Oracle:', error);
+    }
+  }
+
+  /**
    * @notice Start monitoring price changes via Chainlink events
-   * @dev Initializes WebSocket, sets up aggregators, subscribes to AnswerUpdated events
+   * @dev Initializes WebSocket, sets up aggregators, subscribes to AnswerUpdated and SecondaryRoundIdUpdated events
    * @param assets Array of asset addresses to monitor
    * @param onPriceChange Callback function invoked on price updates
    */
@@ -138,19 +187,21 @@ export class PriceOracle {
     this.onPriceChangeCallback = onPriceChange;
     this.initializeWebSocketClient(wssUrl);
     await this.setupChainlinkAggregators(assets);
+    await this.seedInitialPrices(assets);
     this.subscribeToChainlinkEvents(onPriceChange);
     this.isMonitoring = true;
     logger.info(`Monitoring ${this.aggregators.size} Chainlink aggregators`);
   }
 
   /**
-   * @notice Get Chainlink aggregator addresses for assets
-   * @dev Uses multicall for efficiency, queries proxy addresses and aggregator details
+   * @notice Get Chainlink aggregator addresses for assets and classify DualAggregators (SVR)
+   * @dev Uses multicall for efficiency, queries proxy addresses, aggregator details, and typeAndVersion
    * @param assets Array of asset addresses to setup
    */
   private async setupChainlinkAggregators(assets: string[]): Promise<void> {
     const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as `0x${string}`;
-    const proxyAddressCalls = assets.map(asset => ({
+    const normalizedAssets = assets.map(a => a.toLowerCase());
+    const proxyAddressCalls = normalizedAssets.map(asset => ({
       address: this.AAVE_ORACLE,
       abi: this.ORACLE_ABI,
       functionName: 'getSourceOfAsset',
@@ -162,12 +213,12 @@ export class PriceOracle {
     });
     const validAssets: string[] = [];
     const validProxies: `0x${string}`[] = [];
-    for (let i = 0; i < assets.length; i++) {
+    for (let i = 0; i < normalizedAssets.length; i++) {
       const result = proxyResults[i];
       if (result.status === 'success' && result.result) {
         const proxyAddress = result.result as `0x${string}`;
         if (proxyAddress.toLowerCase() !== ZERO_ADDRESS.toLowerCase()) {
-          validAssets.push(assets[i]);
+          validAssets.push(normalizedAssets[i]);
           validProxies.push(proxyAddress);
         }
       }
@@ -188,57 +239,113 @@ export class PriceOracle {
     });
     const aggregatorResults = detailsResults.slice(0, validProxies.length);
     const decimalsResults = detailsResults.slice(validProxies.length);
+
+    const underlyingAddresses: `0x${string}`[] = [];
     for (let i = 0; i < validAssets.length; i++) {
-      const asset = validAssets[i];
       const underlyingAddress = aggregatorResults[i].status === 'success'
         ? aggregatorResults[i].result as `0x${string}`
         : validProxies[i];
+      underlyingAddresses.push(underlyingAddress);
+    }
+
+    // Query typeAndVersion to identify DualAggregator (SVR enabled)
+    const typeCalls = underlyingAddresses.map(addr => ({
+      address: addr,
+      abi: this.CHAINLINK_ABI,
+      functionName: 'typeAndVersion',
+    }));
+    const typeResults = await this.publicClient.multicall({
+      contracts: typeCalls,
+      allowFailure: true,
+    });
+
+    for (let i = 0; i < validAssets.length; i++) {
+      const asset = validAssets[i];
+      const underlyingAddress = underlyingAddresses[i];
       const decimals = decimalsResults[i].status === 'success'
         ? decimalsResults[i].result as number
         : 8;
-      // Target event listener adalah underlying aggregator (yang memancarkan AnswerUpdated),
-      // dengan fallback ke proxyAddress jika kontrak tidak memiliki underlying.
-      this.aggregators.set(asset, { address: underlyingAddress, decimals });
+      const typeStr = typeResults[i].status === 'success' ? (typeResults[i].result as string) : '';
+      const isDualAggregator = typeStr.includes('DualAggregator');
+
+      const aggInfo: ChainlinkAggregator = {
+        address: underlyingAddress,
+        decimals,
+        isDualAggregator,
+      };
+
+      this.aggregators.set(asset, aggInfo);
+
+      const normalizedAgg = underlyingAddress.toLowerCase();
+      if (!this.aggregatorToAssets.has(normalizedAgg)) {
+        this.aggregatorToAssets.set(normalizedAgg, []);
+      }
+      const existing = this.aggregatorToAssets.get(normalizedAgg)!;
+      if (!existing.some(e => e.asset === asset)) {
+        existing.push({ asset, decimals, isDualAggregator });
+      }
     }
   }
 
   /**
-   * @notice Subscribe to Chainlink AnswerUpdated events via WebSocket
-   * @dev Uses single WebSocket subscription with address filter for all aggregators
+   * @notice Subscribe to Chainlink AnswerUpdated and SecondaryRoundIdUpdated events via WebSocket
    * @param onPriceChange Callback function for price updates
    */
   private subscribeToChainlinkEvents(onPriceChange: (updates: PriceUpdate[]) => void): void {
-    const aggregatorAddresses = Array.from(this.aggregators.values()).map(agg => agg.address);
-    const unsubscribe = this.wsClient!.watchEvent({
-      address: aggregatorAddresses as `0x${string}`[],
+    const allAggregatorAddresses = Array.from(
+      new Set(Array.from(this.aggregators.values()).map(agg => agg.address))
+    );
+    if (allAggregatorAddresses.length === 0) return;
+
+    // 1. Subscribe to AnswerUpdated for all aggregators
+    const unsubAnswerUpdated = this.wsClient!.watchEvent({
+      address: allAggregatorAddresses,
       event: parseAbiItem('event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt)'),
       onLogs: async (logs: any[]) => {
         for (const log of logs) {
           try {
             const eventAddress = log.address.toLowerCase();
-            let matchedAsset: string | undefined;
-            let matchedAggregator: { address: string; decimals: number } | undefined;
-            for (const [asset, aggregator] of this.aggregators.entries()) {
-              if (aggregator.address.toLowerCase() === eventAddress) {
-                matchedAsset = asset;
-                matchedAggregator = aggregator;
-                break;
+            const assetEntries = this.aggregatorToAssets.get(eventAddress);
+            if (!assetEntries || assetEntries.length === 0) continue;
+
+            const { current, roundId } = log.args;
+            const decimals = assetEntries[0].decimals;
+            const newPrice = parseFloat(formatUnits(current as bigint, decimals));
+            const roundIdStr = (roundId as bigint).toString();
+
+            // Store in in-memory cache for fast 0ms resolution
+            this.roundPrices.set(`${eventAddress}:${roundIdStr}`, newPrice);
+
+            // Prune cache if it grows too large
+            if (this.roundPrices.size > 500) {
+              const firstKey = this.roundPrices.keys().next().value;
+              if (firstKey) this.roundPrices.delete(firstKey);
+            }
+
+            const isDualAggregator = assetEntries[0].isDualAggregator;
+            if (isDualAggregator) {
+              // SVR DualAggregator: price is cached in memory.
+              // Aave Oracle on-chain price only updates when SecondaryRoundIdUpdated is emitted.
+              logger.debug(`[PriceOracle] SVR AnswerUpdated cached round ${roundIdStr} at $${newPrice}`);
+            } else {
+              // Standard feed (Non-SVR): AnswerUpdated is the direct on-chain update for Aave.
+              const updates: PriceUpdate[] = [];
+              for (const entry of assetEntries) {
+                const oldPrice = this.lastPrices.get(entry.asset);
+                this.lastPrices.set(entry.asset, newPrice);
+                const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+                updates.push({
+                  asset: entry.asset,
+                  oldPrice: oldPrice || newPrice,
+                  newPrice,
+                  percentChange,
+                  source: 'chainlink',
+                });
+              }
+              if (updates.length > 0) {
+                onPriceChange(updates);
               }
             }
-            if (!matchedAsset || !matchedAggregator) continue;
-            const { current } = log.args;
-            const newPrice = parseFloat(formatUnits(current as bigint, matchedAggregator.decimals));
-            const oldPrice = this.lastPrices.get(matchedAsset);
-            this.lastPrices.set(matchedAsset, newPrice);
-            const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
-            const update: PriceUpdate = {
-              asset: matchedAsset,
-              oldPrice: oldPrice || newPrice,
-              newPrice,
-              percentChange,
-              source: 'chainlink',
-            };
-            onPriceChange([update]);
           } catch (error) {
             logger.error('Error handling AnswerUpdated event:', error);
           }
@@ -246,21 +353,93 @@ export class PriceOracle {
       },
       onError: (error: any) => {
         const errorMsg = error?.message || error?.toString() || 'Unknown error';
-        logger.error(`WebSocket error: ${errorMsg}`);
+        logger.error(`WebSocket AnswerUpdated error: ${errorMsg}`);
         this.stopPriceMonitoring();
         if (this.onFatalError) {
           this.onFatalError();
         }
       },
     });
-    this.unsubscribeFns.push(unsubscribe);
+    this.unsubscribeFns.push(unsubAnswerUpdated);
+
+    // 2. Subscribe to SecondaryRoundIdUpdated for SVR DualAggregator feeds
+    const dualAggregatorAddresses = Array.from(
+      new Set(
+        Array.from(this.aggregators.values())
+          .filter(agg => agg.isDualAggregator)
+          .map(agg => agg.address)
+      )
+    );
+
+    if (dualAggregatorAddresses.length > 0) {
+      const unsubSecondary = this.wsClient!.watchEvent({
+        address: dualAggregatorAddresses,
+        event: parseAbiItem('event SecondaryRoundIdUpdated(uint32 indexed secondaryRoundId)'),
+        onLogs: async (logs: any[]) => {
+          for (const log of logs) {
+            try {
+              const eventAddress = log.address.toLowerCase();
+              const assetEntries = this.aggregatorToAssets.get(eventAddress);
+              if (!assetEntries || assetEntries.length === 0) continue;
+
+              const { secondaryRoundId } = log.args;
+              const roundIdStr = secondaryRoundId.toString();
+              let newPrice = this.roundPrices.get(`${eventAddress}:${roundIdStr}`);
+
+              // Fallback to RPC if cache missed (e.g. cold start / reconnect)
+              if (newPrice === undefined) {
+                try {
+                  const roundData = await this.publicClient.readContract({
+                    address: log.address,
+                    abi: this.CHAINLINK_ABI,
+                    functionName: 'getRoundData',
+                    args: [BigInt(secondaryRoundId)],
+                  }) as any;
+                  newPrice = parseFloat(formatUnits(roundData[1] as bigint, assetEntries[0].decimals));
+                  this.roundPrices.set(`${eventAddress}:${roundIdStr}`, newPrice);
+                } catch (err) {
+                  logger.warn(`[PriceOracle] Fallback getRoundData failed for round ${roundIdStr} on ${eventAddress}:`, err);
+                  continue;
+                }
+              }
+
+              const updates: PriceUpdate[] = [];
+              for (const entry of assetEntries) {
+                const oldPrice = this.lastPrices.get(entry.asset);
+                this.lastPrices.set(entry.asset, newPrice);
+                const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+                updates.push({
+                  asset: entry.asset,
+                  oldPrice: oldPrice || newPrice,
+                  newPrice,
+                  percentChange,
+                  source: 'chainlink',
+                });
+              }
+              if (updates.length > 0) {
+                logger.info(`[PriceOracle] SVR SecondaryRoundIdUpdated for ${assetEntries.map(e => e.asset).join(',')} round ${roundIdStr}: $${newPrice}`);
+                onPriceChange(updates);
+              }
+            } catch (error) {
+              logger.error('Error handling SecondaryRoundIdUpdated event:', error);
+            }
+          }
+        },
+        onError: (error: any) => {
+          const errorMsg = error?.message || error?.toString() || 'Unknown error';
+          logger.error(`WebSocket SecondaryRoundIdUpdated error: ${errorMsg}`);
+          this.stopPriceMonitoring();
+          if (this.onFatalError) {
+            this.onFatalError();
+          }
+        },
+      });
+      this.unsubscribeFns.push(unsubSecondary);
+    }
   }
 
   /**
    * @notice Add a new asset to monitoring without restarting the WebSocket connection
-   * @dev Fetches Chainlink Proxy data for the asset, then triggers a full re-subscribe
-   * with the updated aggregator list. Re-subscribe is necessary because Viem watchEvent
-   * address filter cannot be amended after creation.
    * @param assetAddress Underlying asset contract address (Aave reserve token)
    */
   public async addAsset(assetAddress: string): Promise<void> {
@@ -274,6 +453,7 @@ export class PriceOracle {
       logger.warn(`[PriceOracle] addAsset: no valid Chainlink Proxy found for ${normalized}, skipping`);
       return;
     }
+    await this.seedInitialPrices([normalized]);
     if (this.isMonitoring && this.onPriceChangeCallback) {
       this.unsubscribeFns.forEach(unsub => unsub());
       this.unsubscribeFns = [];
@@ -284,8 +464,6 @@ export class PriceOracle {
 
   /**
    * @notice Remove an asset from monitoring without restarting the WebSocket connection
-   * @dev Removes asset from aggregators map and lastPrices cache, then re-subscribes
-   * with the remaining aggregators. If no assets remain, subscriptions are cleared.
    * @param assetAddress Underlying asset contract address (Aave reserve token)
    */
   public removeAsset(assetAddress: string): void {
@@ -293,8 +471,21 @@ export class PriceOracle {
     if (!this.aggregators.has(normalized)) {
       return;
     }
+    const agg = this.aggregators.get(normalized);
     this.aggregators.delete(normalized);
     this.lastPrices.delete(normalized);
+    if (agg) {
+      const aggAddress = agg.address.toLowerCase();
+      const assets = this.aggregatorToAssets.get(aggAddress);
+      if (assets) {
+        const filtered = assets.filter(a => a.asset !== normalized);
+        if (filtered.length > 0) {
+          this.aggregatorToAssets.set(aggAddress, filtered);
+        } else {
+          this.aggregatorToAssets.delete(aggAddress);
+        }
+      }
+    }
     if (this.isMonitoring && this.onPriceChangeCallback) {
       this.unsubscribeFns.forEach(unsub => unsub());
       this.unsubscribeFns = [];
@@ -315,5 +506,7 @@ export class PriceOracle {
     this.unsubscribeFns = [];
     this.isMonitoring = false;
     this.aggregators.clear();
+    this.aggregatorToAssets.clear();
+    this.roundPrices.clear();
   }
 }
