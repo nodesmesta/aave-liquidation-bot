@@ -28,6 +28,10 @@ export class LiquidationExecutor {
   private gasManager: GasManager;
   private nonceManager: NonceManager;
   private chain: Chain;
+  private flashloanPremiumBps: number = 5;
+  private poolAbi = parseAbi([
+    'function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128)',
+  ]);
   private liquidatorAbi = parseAbi([
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover) external',
     'function executeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover, bytes swapPath) external',
@@ -63,10 +67,21 @@ export class LiquidationExecutor {
 
   /**
    * @notice Initialize nonce and gas managers at bot startup
-   * @dev Initializes nonce manager and logs RPC separation architecture
+   * @dev Initializes nonce manager, caches the on-chain flashloan premium, and logs RPC separation architecture
    */
   async initialize(): Promise<void> {
     await this.nonceManager.initialize();
+    try {
+      const premiumRaw = await this.rpcClient.readContract({
+        address: config.aave.pool as Address,
+        abi: this.poolAbi,
+        functionName: 'FLASHLOAN_PREMIUM_TOTAL',
+      });
+      this.flashloanPremiumBps = Number(premiumRaw);
+      logger.info(`Flashloan premium cached: ${this.flashloanPremiumBps} bps (${(this.flashloanPremiumBps / 100).toFixed(2)}%)`);
+    } catch {
+      logger.warn(`Failed to fetch FLASHLOAN_PREMIUM_TOTAL, using fallback ${this.flashloanPremiumBps} bps`);
+    }
     logger.info(`RPC Architecture: walletClient broadcast via Flashblocks (${config.network.preconfUrl}), sequencer verification & receipts via Flashblocks`);
   }
 
@@ -313,6 +328,15 @@ export class LiquidationExecutor {
    */
   getAddress(): string {
     return this.account.address;
+  }
+
+  /**
+   * @notice Get the cached Aave flashloan premium in basis points
+   * @dev Fetched on-chain at initialize(); falls back to 5 bps if the call fails
+   * @return Flashloan premium total in basis points (e.g. 5 = 0.05%)
+   */
+  getFlashloanPremiumBps(): number {
+    return this.flashloanPremiumBps;
   }
 
   /**

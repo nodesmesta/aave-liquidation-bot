@@ -15,6 +15,7 @@ export interface UserReserveData {
   debtBalance: bigint;
   usageAsCollateralEnabled: boolean;
   liquidationBonus: number;
+  liquidationProtocolFee: number;
 }
 
 export interface LiquidationParams {
@@ -37,10 +38,11 @@ export class OptimizedLiquidationService {
   private priceOracle: PriceOracle;
   private publicClient: any;
   private readonly BASE_CURRENCY_DECIMALS = 8;
-  private readonly MIN_LEFTOVER_BASE = 100000000;
-  private readonly SAFETY_MARGIN = 1.1;
+  private readonly MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD = 200000000000; // 2000e8 ($2000)
+  private readonly MIN_LEFTOVER_BASE = 100000000000; // 1000e8 ($1000)
   private readonly MIN_LIQUIDATION_VALUE_USD = 100;
   private readonly CLOSE_FACTOR_HF_THRESHOLD = 0.95;
+  private readonly DEFAULT_LIQUIDATION_CLOSE_FACTOR = 0.5;
   
   private dataProviderAbi = parseAbi([
     'function getUserReserveData(address asset, address user) external view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)',
@@ -151,13 +153,20 @@ export class OptimizedLiquidationService {
   }
 
   /**
-   * @notice Prepare liquidation parameters with collateral constraint and Aave V3 Close Factor
-   * @dev Implements Aave V3 close factor: max 50% debt if HF > 0.95, up to 100% if HF <= 0.95
+   * @notice Prepare liquidation parameters with collateral constraint, Aave v3.3 close factor, and dust prevention
+   * @dev Close factor is 100% by default. The 50% cap applies only when the collateral and debt of this reserve
+   *      are both >= MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD ($2000) and health factor > CLOSE_FACTOR_HF_THRESHOLD (0.95),
+   *      in which case the cap is 50% of the user's total position debt. On partial liquidation, both leftover debt and
+   *      leftover collateral are forced to stay >= MIN_LEFTOVER_BASE ($1000) to satisfy Aave v3.3 MustNotLeaveDust.
+   *      The estimated value and collateral amount are net of the Aave liquidation protocol fee, which is taken as a
+   *      percentage of the bonus portion of the seized collateral (getLiquidationProtocolFee, e.g. 10% on Base).
    * @param userAddress Address of user to liquidate
    * @param collateral Collateral reserve data
    * @param debt Debt reserve data
    * @param priceCache Pre-fetched price map for calculation
    * @param userHealthFactor Health factor of the target user
+   * @param resolveRoute Whether to resolve the Uniswap swap route immediately
+   * @param totalDebtBase User's total position debt in base currency (8 decimals), used for the 50% close factor cap
    * @return Complete liquidation parameters or null if invalid
    */
   async prepareLiquidationParams(
@@ -166,7 +175,8 @@ export class OptimizedLiquidationService {
     debt: UserReserveData,
     priceCache: Map<string, number>,
     userHealthFactor: number = 1.0,
-    resolveRoute: boolean = false
+    resolveRoute: boolean = false,
+    totalDebtBase: bigint = 0n
   ): Promise<LiquidationParams | null> {
     const collateralPrice = priceCache.get(collateral.asset);
     const debtPrice = priceCache.get(debt.asset);
@@ -181,23 +191,36 @@ export class OptimizedLiquidationService {
     const maxDebtByCollateral = maxDebtValueUSD / debtPrice;
     const maxDebtByCollateralBN = BigInt(Math.floor(maxDebtByCollateral * 10 ** debt.decimals));
 
-    // Aave V3 Close Factor Rule:
-    // If Health Factor > 0.95, liquidator can cover at most 50% of the user's debt.
-    // If Health Factor <= 0.95, liquidator can cover up to 100% of the user's debt.
-    const maxProtocolDebt = userHealthFactor > this.CLOSE_FACTOR_HF_THRESHOLD 
-      ? debt.debtBalance / 2n 
-      : debt.debtBalance;
+    const totalDebtFloat = parseFloat(formatUnits(debt.debtBalance, debt.decimals));
+    const debtReserveBase = Math.floor(totalDebtFloat * debtPrice * 10 ** this.BASE_CURRENCY_DECIMALS);
+    const collateralReserveBase = Math.floor(collateralValueUSD * 10 ** this.BASE_CURRENCY_DECIMALS);
 
-    let debtToCover = collateral.collateralBalance === 0n 
-      ? 0n 
+    let maxProtocolDebt = debt.debtBalance;
+
+    const closeFactorCapApplies =
+      collateralReserveBase >= this.MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD &&
+      debtReserveBase >= this.MIN_BASE_MAX_CLOSE_FACTOR_THRESHOLD &&
+      userHealthFactor > this.CLOSE_FACTOR_HF_THRESHOLD;
+
+    if (closeFactorCapApplies) {
+      const totalDebtBaseNum = totalDebtBase > 0n ? Number(totalDebtBase) : debtReserveBase;
+      const defaultLiquidatableBase = totalDebtBaseNum * this.DEFAULT_LIQUIDATION_CLOSE_FACTOR;
+      if (debtReserveBase > defaultLiquidatableBase) {
+        const maxDebtByCloseFactor = (defaultLiquidatableBase / 10 ** this.BASE_CURRENCY_DECIMALS) / debtPrice;
+        maxProtocolDebt = BigInt(Math.floor(maxDebtByCloseFactor * 10 ** debt.decimals));
+      }
+    }
+
+    let debtToCover = collateral.collateralBalance === 0n
+      ? 0n
       : (maxProtocolDebt < maxDebtByCollateralBN ? maxProtocolDebt : maxDebtByCollateralBN);
 
     if (debtToCover === 0n) {
       logger.warn('Calculated debtToCover is 0, skipping liquidation');
       return null;
     }
-    const totalDebtFloat = parseFloat(formatUnits(debt.debtBalance, debt.decimals));
     let debtToCoverFloat = parseFloat(formatUnits(debtToCover, debt.decimals));
+
     if (debtToCover < debt.debtBalance) {
       const collateralToSeizeUSD = debtToCoverFloat * debtPrice * liquidationBonusMultiplier;
       const collateralToSeize = collateralToSeizeUSD / collateralPrice;
@@ -205,18 +228,27 @@ export class OptimizedLiquidationService {
       const collateralLeftover = collateralAmount - collateralToSeize;
       const debtLeftoverBase = Math.ceil(debtLeftover * debtPrice * (10 ** this.BASE_CURRENCY_DECIMALS));
       const collateralLeftoverBase = Math.ceil(collateralLeftover * collateralPrice * (10 ** this.BASE_CURRENCY_DECIMALS));
-      if (debtLeftoverBase < this.MIN_LEFTOVER_BASE || collateralLeftoverBase < this.MIN_LEFTOVER_BASE) {
-        const maxDebtByDebtLeftover = totalDebtFloat - (this.SAFETY_MARGIN / debtPrice);
-        const maxDebtByCollateralLeftover = ((collateralValueUSD - this.SAFETY_MARGIN) / liquidationBonusMultiplier) / debtPrice;
+
+      const collateralFullyConsumed = collateralLeftover <= 0;
+      if (!collateralFullyConsumed &&
+          (debtLeftoverBase < this.MIN_LEFTOVER_BASE || collateralLeftoverBase < this.MIN_LEFTOVER_BASE)) {
+        const minLeftoverUSD = this.MIN_LEFTOVER_BASE / 10 ** this.BASE_CURRENCY_DECIMALS;
+        const maxDebtByDebtLeftover = totalDebtFloat - (minLeftoverUSD / debtPrice);
+        const maxDebtByCollateralLeftover =
+          ((collateralValueUSD - minLeftoverUSD) / liquidationBonusMultiplier) / debtPrice;
         let adjustedDebtToCover = Math.min(maxDebtByDebtLeftover, maxDebtByCollateralLeftover);
         let adjustedDebtToCoverBN = BigInt(Math.floor(adjustedDebtToCover * 10 ** debt.decimals));
         if (adjustedDebtToCoverBN > maxProtocolDebt) {
           adjustedDebtToCoverBN = maxProtocolDebt;
           adjustedDebtToCover = parseFloat(formatUnits(adjustedDebtToCoverBN, debt.decimals));
         }
+        if (adjustedDebtToCoverBN <= 0n) {
+          logger.warn('MustNotLeaveDust: cannot satisfy $1000 leftover on both sides, skipping liquidation');
+          return null;
+        }
         debtToCover = adjustedDebtToCoverBN;
         debtToCoverFloat = adjustedDebtToCover;
-        logger.info(`Adjusted for MustNotLeaveDust: debtLeftover=$${(debtLeftoverBase / 1e8).toFixed(2)}, collateralLeftover=$${(collateralLeftoverBase / 1e8).toFixed(2)}`);
+        logger.info(`Adjusted for MustNotLeaveDust (v3.3, $1000 floor): debtLeftover=$${(debtLeftoverBase / 1e8).toFixed(2)}, collateralLeftover=$${(collateralLeftoverBase / 1e8).toFixed(2)}`);
       }
     }
     if (debtToCover === 0n) {
@@ -224,11 +256,14 @@ export class OptimizedLiquidationService {
       return null;
     }
     const debtToCoverUSD = debtToCoverFloat * debtPrice;
-    const estimatedValueUSD = debtToCoverUSD * liquidationBonusMultiplier;
-    logger.info(`Liquidation calc: totalDebt=${formatUnits(debt.debtBalance, debt.decimals)}, maxProtocolDebt=${formatUnits(maxProtocolDebt, debt.decimals)} (HF: ${userHealthFactor.toFixed(4)}), maxByCollateral=${maxDebtByCollateral.toFixed(4)}, final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)})`);
+    const grossCollateralUSD = debtToCoverUSD * liquidationBonusMultiplier;
+    const bonusCollateralUSD = grossCollateralUSD - grossCollateralUSD / liquidationBonusMultiplier;
+    const protocolFeeUSD = bonusCollateralUSD * (collateral.liquidationProtocolFee / 100);
+    const estimatedValueUSD = grossCollateralUSD - protocolFeeUSD;
+    logger.info(`Liquidation calc: totalDebt=${formatUnits(debt.debtBalance, debt.decimals)}, maxProtocolDebt=${formatUnits(maxProtocolDebt, debt.decimals)} (HF: ${userHealthFactor.toFixed(4)}), maxByCollateral=${maxDebtByCollateral.toFixed(4)}, final=${formatUnits(debtToCover, debt.decimals)} ${debt.symbol} ($${debtToCoverUSD.toFixed(2)}), protocolFee=$${protocolFeeUSD.toFixed(2)}, netValue=$${estimatedValueUSD.toFixed(2)}`);
 
     const estimatedCollateralAmount = BigInt(
-      Math.floor((debtToCoverUSD * liquidationBonusMultiplier / collateralPrice) * (10 ** collateral.decimals))
+      Math.floor((estimatedValueUSD / collateralPrice) * (10 ** collateral.decimals))
     );
 
     const params: LiquidationParams = {
@@ -393,6 +428,7 @@ export class OptimizedLiquidationService {
           debtBalance,
           usageAsCollateralEnabled,
           liquidationBonus: config.liquidationBonus,
+          liquidationProtocolFee: config.liquidationProtocolFee,
         });
       }
       if (userReserves.length > 0) {
@@ -410,7 +446,9 @@ export class OptimizedLiquidationService {
         bestPair.collateral,
         bestPair.debt,
         priceCache,
-        userHealth.healthFactor
+        userHealth.healthFactor,
+        false,
+        userHealth.totalDebtBase
       );
       if (params && params.estimatedValue >= this.MIN_LIQUIDATION_VALUE_USD) {
         resultMap.set(userHealth.user, { params, userHealth });

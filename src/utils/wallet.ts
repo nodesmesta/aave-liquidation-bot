@@ -1,4 +1,4 @@
-import { createWalletClient as viemCreateWalletClient, http } from 'viem';
+import { createWalletClient as viemCreateWalletClient, http, type WalletClient } from 'viem';
 import { privateKeyToAccount, mnemonicToAccount } from 'viem/accounts';
 import { basePreconf } from 'viem/chains';
 import { config } from '../config';
@@ -24,7 +24,7 @@ export function createAccount() {
  * @dev For read operations, use createPublicClient with Alchemy instead
  * @return Viem wallet client instance with flashblocks endpoint
  */
-export function createWalletClient() {
+export function createWalletClient(): WalletClient {
   const account = createAccount();
   return viemCreateWalletClient({
     account,

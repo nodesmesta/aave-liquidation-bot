@@ -7,8 +7,12 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
     "compile": "forge build",
-    "test": "forge test",
+    "test": "forge test -vvv",
+    "test:gas": "forge test --gas-report",
+    "test:close-factor": "tsx test/test-close-factor.ts",
+    "test:asset-manager": "tsx test/test-asset-manager.ts",
     "deploy:testnet": "forge script script/Deploy.s.sol --rpc-url $BASE_SEPOLIA_RPC_URL --broadcast --verify",
     "deploy:mainnet": "forge script script/Deploy.s.sol --rpc-url $BASE_RPC_URL --broadcast --verify"
   },
@@ -22,19 +26,18 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@aave/core-v3": "^1.19.3",
-    "@bgd-labs/aave-address-book": "^3.1.0",
-    "dotenv": "^16.3.1",
-    "graphql-request": "^7.4.0",
-    "viem": "^2.43.2",
-    "winston": "^3.11.0"
+    "@aave/core-v3": "1.19.3",
+    "@bgd-labs/aave-address-book": "3.7.0",
+    "dotenv": "16.6.1",
+    "graphql": "16.12.0",
+    "graphql-request": "7.4.0",
+    "viem": "2.57.7",
+    "winston": "3.19.0"
   },
   "devDependencies": {
-    "@types/chai": "^5.2.3",
-    "@types/mocha": "^10.0.10",
-    "@types/node": "^20.10.5",
-    "tsx": "^4.7.0",
-    "typescript": "^5.3.3"
+    "@types/node": "20.19.27",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
   },
   "engines": {
     "node": ">=20.0.0"

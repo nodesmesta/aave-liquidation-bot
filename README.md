@@ -36,7 +36,6 @@ cd aave-liquidation-bot
 npm install
 git submodule update --init --recursive
 forge build
-npx hardhat compile
 ```
 
 ### Configuration
@@ -121,8 +120,9 @@ FIXED_GAS_LIMIT = 920,000        // TX gas allowance
 # Unit tests
 forge test -vvv
 
-# Integration tests
-npm run test:integration
+# Off-chain calculation tests
+npm run test:close-factor
+npm run test:asset-manager
 
 # Gas report
 forge test --gas-report

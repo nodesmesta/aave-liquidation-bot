@@ -180,7 +180,8 @@ export class LiquidationManager {
     }
     
     for (const liq of validLiquidations) {
-      const grossProfitUSD = liq.params.estimatedValue - liq.params.debtToCoverUSD;
+      const flashloanPremiumUSD = liq.params.debtToCoverUSD * (this.executor.getFlashloanPremiumBps() / 10000);
+      const grossProfitUSD = liq.params.estimatedValue - liq.params.debtToCoverUSD - flashloanPremiumUSD;
       const gasResult = await this.executor.calculateAffordableGasSettings(
         fixedGasLimit,
         liq.params.estimatedValue,
@@ -192,7 +193,7 @@ export class LiquidationManager {
       if (gasResult) {
         const skip = skippedCount > 0 ? ` (skipped ${skippedCount})` : '';
         const netStr = gasResult.netProfitUSD !== undefined ? ` netProfit:$${gasResult.netProfitUSD.toFixed(2)}` : '';
-        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH ($${(gasResult.maxGasCostUSD || 0).toFixed(2)})${netStr} (${paramsLatency}ms)`);
+        logger.info(`Selected${skip}: ${liq.params.collateralSymbol}→${liq.params.debtSymbol} HF:${liq.userHealth.healthFactor.toFixed(4)} value:$${liq.params.estimatedValue.toFixed(0)} premium:$${flashloanPremiumUSD.toFixed(2)} gas:${gasResult.maxGasCostETH.toFixed(6)}ETH ($${(gasResult.maxGasCostUSD || 0).toFixed(2)})${netStr} (${paramsLatency}ms)`);
         
         // Resolve Uniswap V3 route ONLY for this single selected pair right before execution
         await this.optimizedLiquidation.attachSwapRoute(liq.params);

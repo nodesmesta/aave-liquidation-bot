@@ -8,6 +8,7 @@ import { PriceOracle } from './PriceOracle';
 export interface AssetConfig {
   decimals: number;
   liquidationBonus: number;
+  liquidationProtocolFee: number;
   symbol: string;
 }
 
@@ -42,7 +43,8 @@ export class AssetManager {
   ] as const;
 
   private dataProviderAbi = parseAbi([
-    'function getReserveConfigurationData(address asset) external view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen)'
+    'function getReserveConfigurationData(address asset) external view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen)',
+    'function getLiquidationProtocolFee(address asset) external view returns (uint256)'
   ]);
 
   private oracleAbi = parseAbi([
@@ -93,10 +95,18 @@ export class AssetManager {
       args: [r.tokenAddress as Address],
     }));
 
+    const protocolFeeContracts = reserves.map(r => ({
+      address: this.protocolDataProvider,
+      abi: this.dataProviderAbi,
+      functionName: 'getLiquidationProtocolFee',
+      args: [r.tokenAddress as Address],
+    }));
+
     // Eksekusi secara paralel
-    const [configResults, oracleResults] = await Promise.all([
+    const [configResults, oracleResults, protocolFeeResults] = await Promise.all([
       this.publicClient.multicall({ contracts: configContracts }),
-      this.publicClient.multicall({ contracts: oracleContracts })
+      this.publicClient.multicall({ contracts: oracleContracts }),
+      this.publicClient.multicall({ contracts: protocolFeeContracts })
     ]);
 
     this.assetConfigs.clear();
@@ -108,6 +118,7 @@ export class AssetManager {
       const address = reserve.tokenAddress.toLowerCase();
       const configRes = configResults[i];
       const oracleRes = oracleResults[i];
+      const protocolFeeRes = protocolFeeResults[i];
 
       // Memproses desimal dan bonus likuidasi
       if (configRes.status === 'success') {
@@ -117,10 +128,15 @@ export class AssetManager {
         // Konversi format Aave V3: 10500 berarti bonus 5%
         const liquidationBonus = liquidationBonusRaw > 0 ? (liquidationBonusRaw - 10000) / 100 : 0;
 
+        // Liquidation protocol fee: bps dari porsi bonus (mis. 1000 = 10%)
+        const protocolFeeRaw = protocolFeeRes.status === 'success' ? Number(protocolFeeRes.result) : 0;
+        const liquidationProtocolFee = protocolFeeRaw / 100;
+
         this.assetConfigs.set(address, {
           symbol: reserve.symbol,
           decimals,
-          liquidationBonus
+          liquidationBonus,
+          liquidationProtocolFee
         });
       }
 

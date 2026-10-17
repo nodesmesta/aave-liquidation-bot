@@ -36,7 +36,7 @@ async function main() {
   for (const r of reserves) {
     const assetConfig = assetManager.getAssetConfig(r.address);
     if (assetConfig) {
-      console.log(` ✔ ${r.symbol.padEnd(6)} -> Decimals: ${assetConfig.decimals.toString().padEnd(2)} | Liq Bonus: ${assetConfig.liquidationBonus * 100}%`);
+      console.log(` ✔ ${r.symbol.padEnd(6)} -> Decimals: ${assetConfig.decimals.toString().padEnd(2)} | Liq Bonus: ${assetConfig.liquidationBonus}% | Protocol Fee: ${assetConfig.liquidationProtocolFee}%`);
       validCount++;
     } else {
       console.log(` ❌ ${r.symbol.padEnd(6)} -> Konfigurasi Gagal Dimuat!`);
