@@ -146,10 +146,11 @@ class LiquidatorBot {
       this.startBackgroundSync();
     }, 6 * 60 * 60 * 1000);
     
+    // Heartbeat & UserPool snapshot export every 2 minutes
     setInterval(() => {
       this.exportUserPoolSnapshot();
-    }, 10 * 60 * 1000);
-    this.exportUserPoolSnapshot();
+    }, 2 * 60 * 1000);
+    await this.exportUserPoolSnapshot();
     
     logger.info('Bot started - monitoring for opportunities');
   }
