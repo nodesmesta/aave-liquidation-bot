@@ -365,7 +365,7 @@ class LiquidatorBot {
     
     const snapshotPath = path.join(__dirname, '../userpool_snapshot.json');
     await fs.writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
-    logger.debug(`Snapshoot createdt: ${users.length} users`);
+    logger.info(`[Heartbeat] UserPool synced: ${users.length} users monitored (${stats.critical} critical, ${stats.liquidatable} liquidatable) | TVL: $${(stats.totalCollateralUSD / 1000).toFixed(0)}K/$${(stats.totalDebtUSD / 1000).toFixed(0)}K`);
   }
 
 

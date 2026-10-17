@@ -322,29 +322,24 @@ export class PriceOracle {
               if (firstKey) this.roundPrices.delete(firstKey);
             }
 
-            const isDualAggregator = assetEntries[0].isDualAggregator;
-            if (isDualAggregator) {
-              // SVR DualAggregator: price is cached in memory.
-              // Aave Oracle on-chain price only updates when SecondaryRoundIdUpdated is emitted.
-              logger.debug(`[PriceOracle] SVR AnswerUpdated cached round ${roundIdStr} at $${newPrice}`);
-            } else {
-              // Standard feed (Non-SVR): AnswerUpdated is the direct on-chain update for Aave.
-              const updates: PriceUpdate[] = [];
-              for (const entry of assetEntries) {
-                const oldPrice = this.lastPrices.get(entry.asset);
-                this.lastPrices.set(entry.asset, newPrice);
-                const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
-                updates.push({
-                  asset: entry.asset,
-                  oldPrice: oldPrice || newPrice,
-                  newPrice,
-                  percentChange,
-                  source: 'chainlink',
-                });
+            const updates: PriceUpdate[] = [];
+            for (const entry of assetEntries) {
+              const oldPrice = this.lastPrices.get(entry.asset);
+              if (oldPrice !== undefined && oldPrice === newPrice) {
+                continue; // Deduplicate: already processed at this exact price
               }
-              if (updates.length > 0) {
-                onPriceChange(updates);
-              }
+              this.lastPrices.set(entry.asset, newPrice);
+              const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
+              updates.push({
+                asset: entry.asset,
+                oldPrice: oldPrice || newPrice,
+                newPrice,
+                percentChange,
+                source: 'chainlink',
+              });
+            }
+            if (updates.length > 0) {
+              onPriceChange(updates);
             }
           } catch (error) {
             logger.error('Error handling AnswerUpdated event:', error);
@@ -406,6 +401,9 @@ export class PriceOracle {
               const updates: PriceUpdate[] = [];
               for (const entry of assetEntries) {
                 const oldPrice = this.lastPrices.get(entry.asset);
+                if (oldPrice !== undefined && oldPrice === newPrice) {
+                  continue; // Deduplicate: already processed at this exact price
+                }
                 this.lastPrices.set(entry.asset, newPrice);
                 const percentChange = oldPrice ? ((newPrice - oldPrice) / oldPrice) * 100 : 0;
                 updates.push({
