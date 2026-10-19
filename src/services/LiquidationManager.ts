@@ -68,11 +68,12 @@ export class LiquidationManager {
     try {
       const elapsedSincePriceUpdate = Date.now() - this.priceUpdateTimestamp;
 
+      let highRiskHealthMap = new Map<string, UserHealth>();
       // Phase 1: Prioritize high-risk users (HF <= 1.03) if any exist
       if (highRiskUsers.length > 0) {
-        logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (elapsed: ${elapsedSincePriceUpdate}ms)`);
+        logger.info(`Phase 1: Checking ${highRiskUsers.length} high-risk users (HF<=1.03) for liquidation (initiation: ${elapsedSincePriceUpdate}ms)`);
         const highRiskCheckStart = Date.now();
-        const highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
+        highRiskHealthMap = await this.healthChecker.checkUsers(highRiskUsers);
         const highRiskCheckLatency = Date.now() - highRiskCheckStart;
         const liquidatable = this.healthChecker.filterLiquidatable(highRiskHealthMap);
         if (liquidatable.length > 0) {
@@ -88,20 +89,33 @@ export class LiquidationManager {
               }
             }
           }
+        } else {
+          const userHFs = Array.from(highRiskHealthMap.values())
+            .map(h => `${h.user.slice(0, 6)}...${h.user.slice(-4)}: HF ${h.healthFactor.toFixed(4)}`)
+            .join(', ');
+          logger.info(`Phase 1: 0 liquidatable (${highRiskUsers.length} checked on-chain in ${highRiskCheckLatency}ms) | Live HFs: [${userHFs}]`);
         }
       } else {
         logger.info(`Phase 1: 0 high-risk users (HF<=1.03). Evaluating all ${allAffectedUsers.length} affected users on-chain.`);
       }
 
-      // Phase 2: Check all affected users, liquidate if any dropped below 1.0, and update userPool cache
+      // Phase 2: Check remaining affected users (avoiding duplicate multicall for highRiskUsers), and update userPool cache
+      const highRiskSet = new Set(highRiskUsers.map(u => u.toLowerCase()));
+      const remainingUsers = allAffectedUsers.filter(u => !highRiskSet.has(u.toLowerCase()));
+
       const phase2Label = highRiskUsers.length > 0
-        ? `Phase 2: Updating cache and checking remaining ${allAffectedUsers.length} affected users`
+        ? `Phase 2: Updating cache and checking remaining ${remainingUsers.length} affected users (${highRiskUsers.length} already checked in Phase 1)`
         : `Phase 2: Evaluating and syncing ${allAffectedUsers.length} affected users`;
       logger.info(phase2Label);
 
       const cacheUpdateStart = Date.now();
-      const allHealthMap = await this.healthChecker.checkUsers(allAffectedUsers);
+      const remainingHealthMap = remainingUsers.length > 0
+        ? await this.healthChecker.checkUsers(remainingUsers)
+        : new Map<string, UserHealth>();
       const cacheUpdateLatency = Date.now() - cacheUpdateStart;
+
+      // Merge health maps from Phase 1 and Phase 2
+      const allHealthMap = new Map<string, UserHealth>([...highRiskHealthMap, ...remainingHealthMap]);
 
       // Check if any user in Phase 2 escalated to liquidatable (HF < 1.0)
       const phase2Liquidatable = this.healthChecker.filterLiquidatable(allHealthMap);
