@@ -132,6 +132,62 @@ export class LiquidationExecutor {
   }
 
   /**
+   * @notice Fetch current EIP-1559 fees once so callers can reuse them across candidates
+   * @dev Avoids one `estimateFeesPerGas` RPC call per liquidation candidate.
+   * @return Base fee estimates
+   */
+  async getEstimatedFees(): Promise<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> {
+    return this.gasManager.getEstimatedFees();
+  }
+
+  /**
+   * @notice Calculate gas settings from pre-fetched fees with affordability and net profit checks
+   * @dev Same logic as `calculateAffordableGasSettings` but takes the fee estimate as an argument,
+   *      so a batch of candidates only costs one fee RPC call.
+   * @param baseFees Pre-fetched fee estimates
+   * @param gasLimit Gas limit for the transaction
+   * @param liquidationValueUSD Estimated liquidation value in USD
+   * @param walletBalanceETH Wallet balance in ETH for affordability check
+   * @param grossProfitUSD Estimated gross profit in USD
+   * @param ethPriceUSD Current ETH price in USD for gas cost conversion
+   * @return Gas settings with net profit metadata, or null if unaffordable / unprofitable
+   */
+  calculateAffordableGasSettingsWithFees(
+    baseFees: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint },
+    gasLimit: bigint,
+    liquidationValueUSD: number,
+    walletBalanceETH: number,
+    grossProfitUSD?: number,
+    ethPriceUSD?: number
+  ): {
+    gasSettings: { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint; gas: bigint };
+    maxGasCostETH: number;
+    maxGasCostUSD?: number;
+    netProfitUSD?: number;
+  } | null {
+    const gasSettings = this.gasManager.calculateGasSettings(baseFees, gasLimit, liquidationValueUSD);
+    const maxGasCostETH = this.gasManager.calculateMaxGasCostETH(gasSettings);
+    if (walletBalanceETH < maxGasCostETH) {
+      return null;
+    }
+
+    let maxGasCostUSD: number | undefined;
+    let netProfitUSD: number | undefined;
+    if (grossProfitUSD !== undefined && ethPriceUSD !== undefined && ethPriceUSD > 0) {
+      maxGasCostUSD = maxGasCostETH * ethPriceUSD;
+      netProfitUSD = grossProfitUSD - maxGasCostUSD;
+      if (netProfitUSD <= 0) {
+        logger.warn(
+          `Liquidation unprofitable: Gross profit $${grossProfitUSD.toFixed(2)} <= Max gas cost $${maxGasCostUSD.toFixed(2)} (Net: $${netProfitUSD.toFixed(2)}). Skipping.`
+        );
+        return null;
+      }
+    }
+
+    return { gasSettings, maxGasCostETH, maxGasCostUSD, netProfitUSD };
+  }
+
+  /**
    * @notice Calculate gas settings for liquidation with affordability and net profit checks
    * @dev Fetches network fees, calculates boosted gas settings, and validates against wallet balance & net profitability
    * @param gasLimit Gas limit for the transaction
@@ -154,27 +210,14 @@ export class LiquidationExecutor {
     netProfitUSD?: number;
   } | null> {
     const baseFees = await this.gasManager.getEstimatedFees();
-    const gasSettings = this.gasManager.calculateGasSettings(baseFees, gasLimit, liquidationValueUSD);
-    const maxGasCostETH = this.gasManager.calculateMaxGasCostETH(gasSettings);
-    if (walletBalanceETH < maxGasCostETH) {
-      return null;
-    }
-
-    // Net Profit Validation (Anti-Bleeding Gas Guard)
-    let maxGasCostUSD: number | undefined;
-    let netProfitUSD: number | undefined;
-    if (grossProfitUSD !== undefined && ethPriceUSD !== undefined && ethPriceUSD > 0) {
-      maxGasCostUSD = maxGasCostETH * ethPriceUSD;
-      netProfitUSD = grossProfitUSD - maxGasCostUSD;
-      if (netProfitUSD <= 0) {
-        logger.warn(
-          `Liquidation unprofitable: Gross profit $${grossProfitUSD.toFixed(2)} <= Max gas cost $${maxGasCostUSD.toFixed(2)} (Net: $${netProfitUSD.toFixed(2)}). Skipping.`
-        );
-        return null;
-      }
-    }
-
-    return { gasSettings, maxGasCostETH, maxGasCostUSD, netProfitUSD };
+    return this.calculateAffordableGasSettingsWithFees(
+      baseFees,
+      gasLimit,
+      liquidationValueUSD,
+      walletBalanceETH,
+      grossProfitUSD,
+      ethPriceUSD
+    );
   }
 
   /**
