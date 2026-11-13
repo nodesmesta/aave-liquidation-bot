@@ -1,6 +1,7 @@
 import { createPublicClient, http, formatEther } from 'viem';
 import { base, basePreconf } from 'viem/chains';
 import { config, validateConfig } from './config';
+import { HF, HF_RAW, TIMING, hfRawToNumber, isLiquidatableRaw, isPoolTierRaw, shouldPruneRaw, formatHF } from './config/thresholds';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from './utils/logger';
@@ -10,10 +11,31 @@ import { LiquidationExecutor } from './services/LiquidationExecutor';
 import { PriceOracle } from './services/PriceOracle';
 import { SubgraphService } from './services/SubgraphService';
 import { OptimizedLiquidationService } from './services/OptimizedLiquidationService';
-import { UserPool } from './services/UserPool';
 import { AssetManager } from './services/AssetManager';
 import { LiquidationManager } from './services/LiquidationManager';
 import { SmartRouter } from './services/SmartRouter';
+import { UserPool, UserTier } from './services/UserPool';
+
+const DISCOVERY_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000;
+const SNAPSHOT_PATH = path.join(__dirname, '../userpool_snapshot.json');
+
+interface SnapshotUser {
+  address: string;
+  tier?: UserTier;
+  collateralAssets?: string[];
+  debtAssets?: string[];
+  collateralUSD?: number;
+  debtUSD?: number;
+  collateralUSDByAsset?: Record<string, number>;
+  debtUSDByAsset?: Record<string, number>;
+  liquidationThresholdRatio?: number;
+  estimatedHF?: number;
+  lastCheckedHF?: number;
+  lastCheckedHFRaw?: string;
+  lastUpdated?: number;
+  addedAt?: number;
+}
 
 class LiquidatorBot {
   private globalRpcClient: any;
@@ -30,6 +52,7 @@ class LiquidatorBot {
   private isInitialized = false;
   private isPriceMonitoring = false;
   private isRestarting = false;
+  private isExportingSnapshot = false;
   private liquidationManager: LiquidationManager;
 
   constructor() {
@@ -79,141 +102,185 @@ class LiquidatorBot {
   }
 
   /**
-   * @notice Initialize user pool from Subgraph and on-chain validation
-   * @dev Queries USDC borrowers, validates HF < 1.075
+   * @notice Hydrate the user pool from Subgraph + on-chain validation
+   * @dev Runs in the background after monitoring is live; never blocks startup.
+   *      Populates both tiers: POOL (HF < 1.075) and WATCH (1.075 <= HF < 1.15).
    */
   async initialize(): Promise<void> {
-    try {
-      logger.info('Initializing bot (strategy: USDC debt, HF < 1.075)...');
-      await this.executor.initialize();
-      await this.assetManager.initialize();
-      this.assetManager.startEventListening(this.priceOracle);
-      const candidatesMap = await this.subgraphService.getActiveBorrowers();
-      if (candidatesMap.size === 0) {
-        logger.warn('No candidates found from subgraph');
-        this.isInitialized = true;
-        return;
-      }
-      const userAddresses = Array.from(candidatesMap.keys());
-      const validationResults = await this.subgraphService.validateUsersOnChain(
-        userAddresses,
-        config.aave.pool,
-        config.aave.protocolDataProvider
-      );
-      if (validationResults.size === 0) {
-        logger.warn('No at-risk users found on-chain');
-        this.isInitialized = true;
-        return;
-      }
-      logger.info(`Loaded ${validationResults.size} users (${candidatesMap.size} scanned)`);
-      for (const [address, data] of validationResults.entries()) {
-        this.userPool.addUser({
-          address: address,
-          estimatedHF: data.hf,
-          collateralUSD: data.collateral,
-          debtUSD: data.debt,
-          collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
-          debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
-          lastCheckedHF: data.hf,
-          lastUpdated: Date.now(),
-          addedAt: Date.now()
-        });
-      }
-      this.userPool.logStatus();
-
-      this.isInitialized = true;
-      logger.info('Initialization complete');
-    } catch (error) {
-      logger.error('Failed to initialize user pool:', error);
-      throw error;
+    const startedAt = Date.now();
+    logger.info('Hydrating user pool (discovery + on-chain validation)...');
+    const candidatesMap = await this.subgraphService.getActiveBorrowers();
+    if (candidatesMap.size === 0) {
+      logger.warn('No candidates found from subgraph');
+      return;
     }
+    const { atRisk, watched } = await this.subgraphService.validateUsersOnChain(
+      candidatesMap,
+      config.aave.pool,
+      config.aave.protocolDataProvider
+    );
+    let addedPool = 0;
+    let addedWatch = 0;
+    for (const [address, data] of atRisk.entries()) {
+      this.userPool.addUser({
+        address,
+        tier: 'POOL',
+        estimatedHF: data.hf,
+        collateralUSD: data.collateral,
+        debtUSD: data.debt,
+        collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+        debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+        collateralUSDByAsset: data.collateralUSDByAsset ?? {},
+        debtUSDByAsset: data.debtUSDByAsset ?? {},
+        liquidationThresholdRatio: Number(data.liquidationThresholdBps) / 10000,
+        lastCheckedHFRaw: data.hfRaw,
+        lastCheckedHF: data.hf,
+        lastUpdated: Date.now(),
+        addedAt: Date.now()
+      });
+      addedPool++;
+    }
+    for (const [address, data] of watched.entries()) {
+      this.userPool.addUser({
+        address,
+        tier: 'WATCH',
+        estimatedHF: data.hf,
+        collateralUSD: data.collateral,
+        debtUSD: data.debt,
+        collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+        debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+        collateralUSDByAsset: data.collateralUSDByAsset ?? {},
+        debtUSDByAsset: data.debtUSDByAsset ?? {},
+        liquidationThresholdRatio: Number(data.liquidationThresholdBps) / 10000,
+        lastCheckedHFRaw: data.hfRaw,
+        lastCheckedHF: data.hf,
+        lastUpdated: Date.now(),
+        addedAt: Date.now()
+      });
+      addedWatch++;
+    }
+    logger.info(`Hydration complete in ${Date.now() - startedAt}ms: ${addedPool} POOL / ${addedWatch} WATCH (${candidatesMap.size} candidates scanned)`);
+    this.userPool.logStatus();
   }
 
   /**
    * @notice Start liquidation bot
-   * @dev Validates config, checks connection, initializes pool, starts monitoring
+   * @dev Order matters: cheap warmup -> restore last pool -> price monitoring -> background hydration.
+   *      Any execution is re-verified on-chain, so a restored (stale) HF only affects which users get
+   *      checked first, never whether a liquidation is sent.
    */
   async start(): Promise<void> {
     logger.info('Starting liquidation bot...');
     validateConfig();
     logger.info(`Wallet: ${this.account.address}`);
     await this.checkConnection();
-    await this.initialize();
+
+    // 1. Warmup that does not depend on user discovery (~1s)
+    await this.executor.initialize();
+    await this.assetManager.initialize();
+    this.assetManager.startEventListening(this.priceOracle);
+
+    // 2. Restore the last known pool so monitoring starts immediately after a restart
+    const restored = await this.restoreUserPoolSnapshot();
+    this.isInitialized = true;
+
+    // 3. Real-time price monitoring (this used to wait for a full 145s subgraph scan)
     await this.ensurePriceMonitoring();
-    
-    // Background Job: Discovery & Pruning every 6 hours
-    setInterval(() => {
-      this.startBackgroundSync();
-    }, 6 * 60 * 60 * 1000);
-    
-    // Heartbeat & UserPool snapshot export every 2 minutes
-    setInterval(() => {
-      this.exportUserPoolSnapshot();
-    }, 2 * 60 * 1000);
     await this.exportUserPoolSnapshot();
-    
-    logger.info('Bot started - monitoring for opportunities');
+    logger.info(`Bot started - monitoring live (${restored} users restored from snapshot, pool hydration running in background)`);
+
+    // 4. Full discovery in the background, then periodic refresh
+    void this.initialize().catch((error) => logger.error('Background hydration failed:', error));
+    setInterval(() => {
+      void this.startBackgroundSync().catch((error) => logger.error('Background sync failed:', error));
+    }, DISCOVERY_INTERVAL_MS);
+
+    // 5. Periodic POOL sweep. Interest accrual lowers HF with no price event at all, so a
+    //    price-only trigger would never notice those positions drifting under 1.0.
+    setInterval(() => {
+      void this.sweepPoolTier().catch((error) => logger.error('POOL sweep failed:', error));
+    }, TIMING.POOL_SWEEP_INTERVAL_MS);
+
+    // Heartbeat & UserPool snapshot export
+    setInterval(() => {
+      void this.exportUserPoolSnapshot();
+    }, SNAPSHOT_INTERVAL_MS);
+  }
+
+  /**
+   * @notice Restore the tracked pool from the last exported snapshot
+   * @dev Makes cold start ~1s instead of ~145s. Cached HF is intentionally accepted: every execution
+   *      path re-reads getUserAccountData before sending a transaction.
+   * @return Number of users restored (0 when there is no usable snapshot)
+   */
+  private async restoreUserPoolSnapshot(): Promise<number> {
+    try {
+      const raw = await fs.readFile(SNAPSHOT_PATH, 'utf8');
+      const parsed = JSON.parse(raw) as { timestamp?: number; users?: SnapshotUser[] };
+      if (!parsed || !Array.isArray(parsed.users)) {
+        logger.warn('Snapshot has no user list, ignoring it');
+        return 0;
+      }
+      let restored = 0;
+      for (const u of parsed.users) {
+        if (!u?.address || !/^0x[0-9a-fA-F]{40}$/.test(u.address)) continue;
+        // Prefer the raw bigint HF; fall back to the decimal mirror for older snapshots.
+        const hfRaw = typeof u.lastCheckedHFRaw === 'string' && /^\d+$/.test(u.lastCheckedHFRaw)
+          ? BigInt(u.lastCheckedHFRaw)
+          : BigInt(Math.round((typeof u.lastCheckedHF === 'number' ? u.lastCheckedHF : (u.estimatedHF ?? 1.2)) * 1e18));
+        const hf = hfRawToNumber(hfRaw);
+        const tier: UserTier = u.tier === 'WATCH' || (u.tier !== 'POOL' && !isPoolTierRaw(hfRaw)) ? 'WATCH' : 'POOL';
+        this.userPool.addUser({
+          address: u.address,
+          tier,
+          collateralAssets: (u.collateralAssets ?? []).map(a => a.toLowerCase()),
+          debtAssets: (u.debtAssets ?? []).map(a => a.toLowerCase()),
+          collateralUSD: typeof u.collateralUSD === 'number' ? u.collateralUSD : 0,
+          debtUSD: typeof u.debtUSD === 'number' ? u.debtUSD : 0,
+          collateralUSDByAsset: u.collateralUSDByAsset ?? {},
+          debtUSDByAsset: u.debtUSDByAsset ?? {},
+          liquidationThresholdRatio: typeof u.liquidationThresholdRatio === 'number' ? u.liquidationThresholdRatio : 0,
+          estimatedHF: typeof u.estimatedHF === 'number' ? u.estimatedHF : hf,
+          lastCheckedHFRaw: hfRaw,
+          lastCheckedHF: hf,
+          lastUpdated: typeof u.lastUpdated === 'number' ? u.lastUpdated : Date.now(),
+          addedAt: typeof u.addedAt === 'number' ? u.addedAt : Date.now(),
+        });
+        restored++;
+      }
+      const ageMin = typeof parsed.timestamp === 'number' ? Math.round((Date.now() - parsed.timestamp) / 60000) : -1;
+      logger.info(`Restored ${restored} users from snapshot (age ${ageMin} min) - cached HF will be re-verified on-chain before execution`);
+      return restored;
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') {
+        logger.info('No snapshot found - monitoring starts with an empty pool until hydration completes');
+      } else {
+        logger.warn('Failed to restore snapshot, continuing with an empty pool:', error);
+      }
+      return 0;
+    }
   }
 
 
   /**
    * @notice Handle state synchronization after successful liquidation without restart
-   * @dev Updates liquidated user status, and checks watched candidates (1.075 <= HF <= 1.15)
+   * @dev Re-reads the liquidated user on-chain and re-tiers it. No global sweep here: watched users
+   *      are now part of UserPool and are re-evaluated by the price-change handler, so a liquidation
+   *      no longer blocks the pipeline.
    */
   private async handleLiquidationSuccess(liquidatedUser: string): Promise<void> {
     logger.info(`Handling post-liquidation sync for user: ${liquidatedUser}`);
     try {
-      // 1. Sync user yang baru saja dilikuidasi
       const health = await this.healthChecker.checkUser(liquidatedUser);
-      if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
+      if (health.totalDebtBase === 0n || shouldPruneRaw(health.healthFactorRaw)) {
         this.userPool.removeUser(liquidatedUser);
-        logger.info(`Post-liquidation: User ${liquidatedUser} removed from pool (HF: ${health.healthFactor.toFixed(4)})`);
-        if (health.healthFactor < 1.15 && health.totalDebtBase > 0n) {
-          this.subgraphService.getWatchedCandidates().add(liquidatedUser.toLowerCase());
-        }
-      } else {
-        this.userPool.updateUserHF(liquidatedUser, health.healthFactor);
-        logger.info(`Post-liquidation: User ${liquidatedUser} updated in pool (new HF: ${health.healthFactor.toFixed(4)})`);
+        logger.info(`Post-liquidation: User ${liquidatedUser} removed from pool (HF: ${formatHF(health.healthFactorRaw)})`);
+        return;
       }
-
-      // 2. Cek watched candidates (1.075 <= HF <= 1.15) jika ada pergerakan pasar
-      const watched = this.subgraphService.getWatchedCandidates();
-      if (watched.size > 0) {
-        const watchedList = Array.from(watched);
-        logger.info(`Checking ${watchedList.length} watched candidates (1.075 <= HF <= 1.15) for risk escalation...`);
-        const healthMap = await this.healthChecker.checkUsers(watchedList);
-        const escalatedUsers: string[] = [];
-        for (const [addr, h] of healthMap.entries()) {
-          if (h.healthFactor < 1.075 && h.totalDebtBase > 0n) {
-            escalatedUsers.push(addr);
-          } else if (h.healthFactor >= 1.15 || h.totalDebtBase === 0n) {
-            watched.delete(addr);
-          }
-        }
-
-        if (escalatedUsers.length > 0) {
-          logger.info(`Found ${escalatedUsers.length} watched candidates escalated to HF < 1.075! Ingesting...`);
-          const validationResults = await this.subgraphService.validateUsersOnChain(
-            escalatedUsers,
-            config.aave.pool,
-            config.aave.protocolDataProvider
-          );
-          for (const [address, data] of validationResults.entries()) {
-            this.userPool.addUser({
-              address: address,
-              estimatedHF: data.hf,
-              collateralUSD: data.collateral,
-              debtUSD: data.debt,
-              collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
-              debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
-              lastCheckedHF: data.hf,
-              lastUpdated: Date.now(),
-              addedAt: Date.now()
-            });
-          }
-          this.userPool.logStatus();
-        }
-      }
+      const tier: UserTier = isPoolTierRaw(health.healthFactorRaw) ? 'POOL' : 'WATCH';
+      this.userPool.setTier(liquidatedUser, tier);
+      this.userPool.updateUserHF(liquidatedUser, health.healthFactorRaw, health.currentLiquidationThreshold);
+      logger.info(`Post-liquidation: User ${liquidatedUser} updated (new HF: ${formatHF(health.healthFactorRaw)}, tier: ${tier})`);
     } catch (error) {
       logger.error('Error during post-liquidation sync:', error);
     }
@@ -277,63 +344,134 @@ class LiquidatorBot {
 
 
   /**
+   * @notice Periodic sweep of the POOL tier, independent of price events
+   * @dev Interest accrual lowers HF without any Chainlink update, so a price-only trigger would
+   *      never notice those positions. Only the POOL tier (HF < 1.075) is swept, which keeps the
+   *      RPC cost bounded and proportional to the number of genuinely at-risk users.
+   */
+  private async sweepPoolTier(): Promise<void> {
+    if (!this.isInitialized || this.isRestarting) return;
+    const poolUsers = this.userPool.getAllUsers().filter(u => u.tier === 'POOL');
+    if (poolUsers.length === 0) return;
+    try {
+      const healthMap = await this.healthChecker.checkUsers(poolUsers.map(u => u.address));
+      let removed = 0;
+      let promoted = 0;
+      for (const [address, health] of healthMap.entries()) {
+        if (health.totalDebtBase === 0n || shouldPruneRaw(health.healthFactorRaw)) {
+          this.userPool.removeUser(address);
+          removed++;
+          continue;
+        }
+        const tier: UserTier = isPoolTierRaw(health.healthFactorRaw) ? 'POOL' : 'WATCH';
+        if (tier !== 'POOL') {
+          this.userPool.setTier(address, tier);
+        }
+        this.userPool.updateUserHF(address, health.healthFactorRaw, health.currentLiquidationThreshold);
+        if (isLiquidatableRaw(health.healthFactorRaw)) promoted++;
+      }
+      if (removed > 0 || promoted > 0) {
+        logger.info(`POOL sweep: ${poolUsers.length} checked, ${removed} removed, ${promoted} liquidatable`);
+      }
+    } catch (error) {
+      logger.error('Error during POOL sweep:', error);
+    }
+  }
+
+  /**
    * @notice Background job for dynamic user discovery and pruning
-   * @dev Runs periodically to find new borrowers and prune safe ones
+   * @dev Prune threshold is a single HF >= 1.15 for both tiers; tier labels are refreshed from the
+   *      on-chain HF, and asset composition is refreshed from the subgraph without extra RPC.
    */
   private async startBackgroundSync(): Promise<void> {
     if (!this.isInitialized || this.isRestarting) return;
     logger.info('Starting background sync (Discovery & Pruning)...');
     try {
-      const allTrackedUsers = this.userPool.getAllUsers().map(u => u.address);
-      if (allTrackedUsers.length > 0) {
-        logger.info(`Pruning: Validating ${allTrackedUsers.length} existing users...`);
-        const healthMap = await this.healthChecker.checkUsers(allTrackedUsers);
+      // 1. Re-check tracked users on-chain: prune out-of-range, keep tier labels truthful
+      const trackedUsers = this.userPool.getAllUsers();
+      if (trackedUsers.length > 0) {
+        logger.info(`Pruning: Validating ${trackedUsers.length} tracked users...`);
+        const healthMap = await this.healthChecker.checkUsers(trackedUsers.map(u => u.address));
         let pruned = 0;
+        let promoted = 0;
         for (const [address, health] of healthMap.entries()) {
-          if (health.healthFactor >= 1.1 || health.totalDebtBase === 0n) {
+          const tracked = this.userPool.getUser(address);
+          if (!tracked) continue;
+          if (health.totalDebtBase === 0n || shouldPruneRaw(health.healthFactorRaw)) {
             this.userPool.removeUser(address);
             pruned++;
-            if (health.healthFactor < 1.15 && health.totalDebtBase > 0n) {
-              this.subgraphService.getWatchedCandidates().add(address.toLowerCase());
-            }
-          } else {
-            this.userPool.updateUserHF(address, health.healthFactor);
+            continue;
           }
+          const tier: UserTier = isPoolTierRaw(health.healthFactorRaw) ? 'POOL' : 'WATCH';
+          if (tracked.tier !== tier) {
+            this.userPool.setTier(address, tier);
+            if (tier === 'POOL') promoted++;
+          }
+          this.userPool.updateUserHF(address, health.healthFactorRaw, health.currentLiquidationThreshold);
         }
-        logger.info(`Pruning complete: Removed ${pruned} safe/repaid users.`);
+        logger.info(`Pruning complete: removed ${pruned} users (HF >= ${HF.WATCH_MAX} or repaid), ${promoted} escalated to POOL.`);
       }
 
-      logger.info('Discovery: Querying subgraph for new active borrowers...');
+      // 2. Discovery: refresh composition for tracked users, validate only untracked candidates
+      logger.info('Discovery: Querying subgraph for active borrowers...');
       const candidatesMap = await this.subgraphService.getActiveBorrowers();
-      const newAddresses = Array.from(candidatesMap.keys()).filter(addr => 
-        !allTrackedUsers.includes(addr.toLowerCase())
+      const trackedSet = new Set(this.userPool.getAllUsers().map(u => u.address));
+      let assetsRefreshed = 0;
+      for (const [address, assets] of candidatesMap.entries()) {
+        if (trackedSet.has(address) && this.userPool.updateUserAssets(address, assets)) {
+          assetsRefreshed++;
+        }
+      }
+      const newCandidates = new Map(
+        [...candidatesMap.entries()].filter(([address]) => !trackedSet.has(address))
       );
-      
-      if (newAddresses.length > 0) {
-        logger.info(`Discovery: Found ${newAddresses.length} new candidates to validate.`);
-        const validationResults = await this.subgraphService.validateUsersOnChain(
-          newAddresses,
+
+      if (newCandidates.size > 0) {
+        logger.info(`Discovery: ${newCandidates.size} new candidates to validate (${candidatesMap.size} total).`);
+        const { atRisk, watched } = await this.subgraphService.validateUsersOnChain(
+          newCandidates,
           config.aave.pool,
           config.aave.protocolDataProvider
         );
-        let added = 0;
-        for (const [address, data] of validationResults.entries()) {
+        for (const [address, data] of atRisk.entries()) {
           this.userPool.addUser({
-            address: address,
+            address,
+            tier: 'POOL',
             estimatedHF: data.hf,
             collateralUSD: data.collateral,
             debtUSD: data.debt,
             collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
             debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+            collateralUSDByAsset: data.collateralUSDByAsset ?? {},
+            debtUSDByAsset: data.debtUSDByAsset ?? {},
+            liquidationThresholdRatio: Number(data.liquidationThresholdBps) / 10000,
+            lastCheckedHFRaw: data.hfRaw,
             lastCheckedHF: data.hf,
             lastUpdated: Date.now(),
             addedAt: Date.now()
           });
-          added++;
         }
-        logger.info(`Discovery complete: Added ${added} new at-risk users to pool.`);
+        for (const [address, data] of watched.entries()) {
+          this.userPool.addUser({
+            address,
+            tier: 'WATCH',
+            estimatedHF: data.hf,
+            collateralUSD: data.collateral,
+            debtUSD: data.debt,
+            collateralAssets: data.collateralAssets.map((addr: string) => addr.toLowerCase()),
+            debtAssets: data.debtAssets.map((addr: string) => addr.toLowerCase()),
+            collateralUSDByAsset: data.collateralUSDByAsset ?? {},
+            debtUSDByAsset: data.debtUSDByAsset ?? {},
+            liquidationThresholdRatio: Number(data.liquidationThresholdBps) / 10000,
+            lastCheckedHFRaw: data.hfRaw,
+            lastCheckedHF: data.hf,
+            lastUpdated: Date.now(),
+            addedAt: Date.now()
+          });
+        }
+        logger.info(`Discovery complete: added ${atRisk.size} POOL / ${watched.size} WATCH, refreshed ${assetsRefreshed} asset lists.`);
       } else {
-        logger.info('Discovery complete: No new candidates found.');
+        logger.info(`Discovery complete: no new candidates, refreshed ${assetsRefreshed} asset lists.`);
       }
       this.userPool.logStatus();
     } catch (error) {
@@ -343,30 +481,46 @@ class LiquidatorBot {
 
   /**
    * @notice Export UserPool snapshot to JSON file for monitoring (async, non-blocking)
-   * @dev Called periodically and can be read by external monitoring tools
+   * @dev Written atomically (temp + rename) so a reader never sees a truncated file, and a write
+   *      failure degrades the export instead of crashing the process (unhandled rejection).
    */
   private async exportUserPoolSnapshot(): Promise<void> {
-    const stats = this.userPool.getStats();
-    const users = this.userPool.getAllUsers();
-    
-    const snapshot = {
-      timestamp: Date.now(),
-      stats,
-      users: users.map(u => ({
-        address: u.address,
-        collateralAssets: u.collateralAssets,
-        debtAssets: u.debtAssets,
-        collateralUSD: u.collateralUSD,
-        debtUSD: u.debtUSD,
-        lastCheckedHF: u.lastCheckedHF,
-        lastUpdated: u.lastUpdated,
-        addedAt: u.addedAt,
-      })),
-    };
-    
-    const snapshotPath = path.join(__dirname, '../userpool_snapshot.json');
-    await fs.writeFile(snapshotPath, JSON.stringify(snapshot, null, 2));
-    logger.info(`[Heartbeat] UserPool synced: ${users.length} users monitored (${stats.critical} critical, ${stats.liquidatable} liquidatable) | TVL: $${(stats.totalCollateralUSD / 1000).toFixed(0)}K/$${(stats.totalDebtUSD / 1000).toFixed(0)}K`);
+    if (this.isExportingSnapshot) return;
+    this.isExportingSnapshot = true;
+    try {
+      const stats = this.userPool.getStats();
+      const users = this.userPool.getAllUsers();
+
+      const snapshot = {
+        schemaVersion: 3,
+        timestamp: Date.now(),
+        stats,
+        users: users.map(u => ({
+          address: u.address,
+          tier: u.tier,
+          collateralAssets: u.collateralAssets,
+          debtAssets: u.debtAssets,
+          collateralUSD: u.collateralUSD,
+          debtUSD: u.debtUSD,
+          collateralUSDByAsset: u.collateralUSDByAsset,
+          debtUSDByAsset: u.debtUSDByAsset,
+          estimatedHF: u.estimatedHF,
+          lastCheckedHF: u.lastCheckedHF,
+          lastCheckedHFRaw: u.lastCheckedHFRaw.toString(),
+          lastUpdated: u.lastUpdated,
+          addedAt: u.addedAt,
+        })),
+      };
+
+      const tmpPath = `${SNAPSHOT_PATH}.tmp`;
+      await fs.writeFile(tmpPath, JSON.stringify(snapshot, null, 2));
+      await fs.rename(tmpPath, SNAPSHOT_PATH);
+      logger.info(`[Heartbeat] UserPool synced: ${users.length} users (${stats.pool} pool / ${stats.watched} watch, ${stats.critical} critical, ${stats.liquidatable} liquidatable) | TVL: $${(stats.totalCollateralUSD / 1000).toFixed(0)}K/$${(stats.totalDebtUSD / 1000).toFixed(0)}K`);
+    } catch (error) {
+      logger.error(`[Heartbeat] Snapshot export failed (bot keeps running):`, error);
+    } finally {
+      this.isExportingSnapshot = false;
+    }
   }
 
 

@@ -26,6 +26,8 @@ export class PriceOracle {
   private aggregatorToAssets: Map<string, Array<{ asset: string; decimals: number; isDualAggregator: boolean }>> = new Map();
   private roundPrices: Map<string, number> = new Map();
   private unsubscribeFns: (() => void)[] = [];
+  /** Aggregator addresses currently covered by an active subscription. */
+  private subscribedAggregators: Set<string> = new Set();
   private onFatalError: (() => void) | null = null;
   private onPriceChangeCallback: ((updates: PriceUpdate[]) => void) | null = null;
   private readonly AAVE_ORACLE: `0x${string}`;
@@ -289,17 +291,26 @@ export class PriceOracle {
 
   /**
    * @notice Subscribe to Chainlink AnswerUpdated and SecondaryRoundIdUpdated events via WebSocket
+   * @dev Subscriptions are diffed against `subscribedAggregators`: only newly added aggregators are
+   *      subscribed, so adding one asset no longer tears down and rebuilds every existing
+   *      subscription (which used to drop events during the gap).
    * @param onPriceChange Callback function for price updates
    */
   private subscribeToChainlinkEvents(onPriceChange: (updates: PriceUpdate[]) => void): void {
     const allAggregatorAddresses = Array.from(
-      new Set(Array.from(this.aggregators.values()).map(agg => agg.address))
+      new Set(Array.from(this.aggregators.values()).map(agg => agg.address.toLowerCase()))
     );
     if (allAggregatorAddresses.length === 0) return;
 
-    // 1. Subscribe to AnswerUpdated for all aggregators
+    const newAggregators = allAggregatorAddresses.filter(a => !this.subscribedAggregators.has(a));
+    if (newAggregators.length === 0) {
+      logger.debug('[PriceOracle] No new aggregators to subscribe');
+      return;
+    }
+
+    // 1. Subscribe to AnswerUpdated for the new aggregators only
     const unsubAnswerUpdated = this.wsClient!.watchEvent({
-      address: allAggregatorAddresses,
+      address: newAggregators as `0x${string}`[],
       event: parseAbiItem('event AnswerUpdated(int256 indexed current, uint256 indexed roundId, uint256 updatedAt)'),
       onLogs: async (logs: any[]) => {
         for (const log of logs) {
@@ -358,17 +369,14 @@ export class PriceOracle {
     this.unsubscribeFns.push(unsubAnswerUpdated);
 
     // 2. Subscribe to SecondaryRoundIdUpdated for SVR DualAggregator feeds
-    const dualAggregatorAddresses = Array.from(
-      new Set(
-        Array.from(this.aggregators.values())
-          .filter(agg => agg.isDualAggregator)
-          .map(agg => agg.address)
-      )
-    );
+    const dualAggregatorAddresses = newAggregators.filter(addr => {
+      const entries = this.aggregatorToAssets.get(addr);
+      return entries?.some(e => e.isDualAggregator) ?? false;
+    });
 
     if (dualAggregatorAddresses.length > 0) {
       const unsubSecondary = this.wsClient!.watchEvent({
-        address: dualAggregatorAddresses,
+        address: dualAggregatorAddresses as `0x${string}`[],
         event: parseAbiItem('event SecondaryRoundIdUpdated(uint32 indexed secondaryRoundId)'),
         onLogs: async (logs: any[]) => {
           for (const log of logs) {
@@ -434,6 +442,11 @@ export class PriceOracle {
       });
       this.unsubscribeFns.push(unsubSecondary);
     }
+
+    for (const addr of newAggregators) {
+      this.subscribedAggregators.add(addr);
+    }
+    logger.info(`[PriceOracle] Subscribed to ${newAggregators.length} new aggregator(s) (${this.subscribedAggregators.size} total)`);
   }
 
   /**
@@ -453,8 +466,7 @@ export class PriceOracle {
     }
     await this.seedInitialPrices([normalized]);
     if (this.isMonitoring && this.onPriceChangeCallback) {
-      this.unsubscribeFns.forEach(unsub => unsub());
-      this.unsubscribeFns = [];
+      // Only the new aggregator is subscribed; existing subscriptions stay untouched.
       this.subscribeToChainlinkEvents(this.onPriceChangeCallback);
     }
     logger.info(`[PriceOracle] Asset added: ${normalized}. Monitoring ${this.aggregators.size} assets.`);
@@ -472,6 +484,7 @@ export class PriceOracle {
     const agg = this.aggregators.get(normalized);
     this.aggregators.delete(normalized);
     this.lastPrices.delete(normalized);
+    let aggregatorOrphaned = false;
     if (agg) {
       const aggAddress = agg.address.toLowerCase();
       const assets = this.aggregatorToAssets.get(aggAddress);
@@ -481,12 +494,16 @@ export class PriceOracle {
           this.aggregatorToAssets.set(aggAddress, filtered);
         } else {
           this.aggregatorToAssets.delete(aggAddress);
+          aggregatorOrphaned = true;
         }
       }
     }
-    if (this.isMonitoring && this.onPriceChangeCallback) {
+    // Only rebuild subscriptions when an aggregator is no longer used by any asset. Removing one
+    // asset that shares a feed with others must not tear down the live subscriptions.
+    if (aggregatorOrphaned && this.isMonitoring && this.onPriceChangeCallback) {
       this.unsubscribeFns.forEach(unsub => unsub());
       this.unsubscribeFns = [];
+      this.subscribedAggregators.clear();
       if (this.aggregators.size > 0) {
         this.subscribeToChainlinkEvents(this.onPriceChangeCallback);
       }
@@ -502,6 +519,7 @@ export class PriceOracle {
     if (!this.isMonitoring) return;
     this.unsubscribeFns.forEach(unsubscribe => unsubscribe());
     this.unsubscribeFns = [];
+    this.subscribedAggregators.clear();
     this.isMonitoring = false;
     this.aggregators.clear();
     this.aggregatorToAssets.clear();

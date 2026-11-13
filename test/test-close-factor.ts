@@ -120,10 +120,15 @@ async function main() {
 
   // ---------------------------------------------------------------------------
   // Scenario 4: Dust guard. Large position $5000 debt, HF 0.92 (100% allowed),
-  // but collateral only ~$2600 so partial liquidation would leave < $1000 on a side.
-  // Expect debtToCover adjusted so leftovers respect $1000, i.e. debtToCover < full.
+  // but collateral only ~$2600.
+  //
+  // Aave does NOT clamp debtToCover to what the collateral can back. It asks for the full
+  // $5000, then `_calculateAvailableCollateralToLiquidate` caps the SEIZED COLLATERAL at the
+  // user's balance and reduces the repaid debt to ~$2476. Because the collateral is fully
+  // consumed, `MustNotLeaveDust` is skipped entirely (it only applies when neither side is
+  // cleared). So the correct answer is debtToCover = $5000, repaid = ~$2476.
   // ---------------------------------------------------------------------------
-  console.log('\n[S4] dust guard: coll ~$2600 vs debt $5000, HF 0.92 -> partial adjusted for $1000 floor');
+  console.log('\n[S4] dust guard: coll ~$2600 vs debt $5000, HF 0.92 -> full request, collateral-capped repay');
   const smallWeth: UserReserveData = {
     asset: WETH, symbol: 'WETH', decimals: 18,
     collateralBalance: parseUnits('0.8667', 18), // ~$2600
@@ -134,11 +139,9 @@ async function main() {
     '0x4444444444444444444444444444444444444444',
     smallWeth, debt5000, priceCache, 0.92, false, base(5000)
   );
-  // Collateral can absorb ~$2600/1.05 = ~$2476 of debt. Full debt not possible.
-  // Leftover collateral would be ~0, leftover debt ~ $2524 (>= $1000). The guard
-  // must ensure the collateral leftover is either 0 (fully consumed) or >= $1000.
-  const p4ok = !!p4 && p4.debtToCover < parseUnits('5000', 6) && p4.debtToCoverUSD > 0;
-  check('S4 partial liquidation respects dust guard',
+  // Aave requests the full debt; the collateral cap is applied inside the seize calculation.
+  const p4ok = !!p4 && p4.debtToCover === parseUnits('5000', 6) && p4.debtToCoverUSD > 0;
+  check('S4 requests full debt, collateral cap applied at seize time',
     p4ok,
     `debtToCover=${p4?.debtToCover} ($${p4?.debtToCoverUSD.toFixed(2)}), estValue=$${p4?.estimatedValue.toFixed(2)}`);
 

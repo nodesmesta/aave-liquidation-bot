@@ -1,9 +1,18 @@
 import { parseAbi, Address } from 'viem';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import {
+  HF_RAW,
+  hfRawToNumber,
+  isLiquidatableRaw,
+  formatHF,
+} from '../config/thresholds';
 
 export interface UserHealth {
   user: string;
+  /** Raw 1e18-scaled health factor. `type(uint256).max` when the user has no debt. */
+  healthFactorRaw: bigint;
+  /** Display-only decimal health factor (truncated, never rounded). Infinity when no debt. */
   healthFactor: number;
   totalCollateralBase: bigint;
   totalDebtBase: bigint;
@@ -38,30 +47,31 @@ export class HealthChecker {
       functionName: 'getUserAccountData',
       args: [userAddress as Address],
     });
-    const [totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactor] = result as [bigint, bigint, bigint, bigint, bigint, bigint];
-    const hf = Number(healthFactor) / 1e18;
+    const [totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactorRaw] = result as [bigint, bigint, bigint, bigint, bigint, bigint];
     return {
       user: userAddress,
-      healthFactor: hf,
+      healthFactorRaw,
+      healthFactor: hfRawToNumber(healthFactorRaw),
       totalCollateralBase,
       totalDebtBase,
       availableBorrowsBase,
       currentLiquidationThreshold,
       ltv,
-      status: this.determineStatus(hf),
+      status: this.determineStatus(healthFactorRaw),
     };
   }
 
   /**
    * @notice Check multiple users using viem multicall for maximum performance
-   * @dev Batches users in chunks of 100 for safety, 100x faster than sequential calls
+   * @dev Batches users using the shared rate-limit config and `allowFailure: true` so a single
+   *      reverting user cannot invalidate the whole batch.
    * @param userAddresses Array of user addresses to check
    * @return Map of user address to health data
    */
   async checkUsers(userAddresses: string[]): Promise<Map<string, UserHealth>> {
     if (userAddresses.length === 0) return new Map();
     const results = new Map<string, UserHealth>();
-    const BATCH_SIZE = 100;
+    const BATCH_SIZE = config.rateLimit.batchSize;
     const totalBatches = Math.ceil(userAddresses.length / BATCH_SIZE);
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
       const start = batchIndex * BATCH_SIZE;
@@ -74,23 +84,23 @@ export class HealthChecker {
           functionName: 'getUserAccountData',
           args: [address as Address],
         })),
+        allowFailure: true,
       });
       for (let i = 0; i < multicallResults.length; i++) {
         const result = multicallResults[i];
         const userAddress = batchAddresses[i];
         if (result.status === 'success' && result.result) {
-          const [totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactor] = result.result as [bigint, bigint, bigint, bigint, bigint, bigint];
-          const hf = Number(healthFactor) / 1e18;
-          const status = this.determineStatus(hf);
+          const [totalCollateralBase, totalDebtBase, availableBorrowsBase, currentLiquidationThreshold, ltv, healthFactorRaw] = result.result as [bigint, bigint, bigint, bigint, bigint, bigint];
           results.set(userAddress.toLowerCase(), {
             user: userAddress,
-            healthFactor: hf,
+            healthFactorRaw,
+            healthFactor: hfRawToNumber(healthFactorRaw),
             totalCollateralBase,
             totalDebtBase,
             availableBorrowsBase,
             currentLiquidationThreshold,
             ltv,
-            status,
+            status: this.determineStatus(healthFactorRaw),
           });
         } else {
           const errorMsg = result.error?.message || result.status;
@@ -102,27 +112,27 @@ export class HealthChecker {
   }
 
   /**
-   * @notice Determine user status based on health factor
-   * @dev Aligned with bot strategy (HF < 1.1): <1.0=LIQUIDATABLE, <1.05=CRITICAL, <1.1=WARNING, >=1.1=SAFE
-   * @param healthFactor User's health factor (normalized to decimal)
+   * @notice Determine user status from the raw health factor
+   * @dev All comparisons are bigint, so a HF of 0.999999999999999999 is correctly LIQUIDATABLE.
+   * @param healthFactorRaw Raw 1e18-scaled health factor
    * @return Status label for the user
    */
-  private determineStatus(healthFactor: number): UserHealth['status'] {
-    if (healthFactor < 1.0) return 'LIQUIDATABLE';
-    if (healthFactor < 1.05) return 'CRITICAL';
-    if (healthFactor < 1.1) return 'WARNING';
+  private determineStatus(healthFactorRaw: bigint): UserHealth['status'] {
+    if (healthFactorRaw < HF_RAW.ONE) return 'LIQUIDATABLE';
+    if (healthFactorRaw < HF_RAW.CRITICAL) return 'CRITICAL';
+    if (healthFactorRaw < HF_RAW.WARNING) return 'WARNING';
     return 'SAFE';
   }
 
   /**
    * @notice Filter users with health factor below 1.0 (liquidatable)
-   * @dev Extracts only users with status 'LIQUIDATABLE'
+   * @dev Uses the raw bigint comparison, not the display number.
    * @param healthMap Map of user addresses to health data
    * @return Array of liquidatable users
    */
   filterLiquidatable(healthMap: Map<string, UserHealth>): UserHealth[] {
     return Array.from(healthMap.values()).filter(
-      (health) => health.status === 'LIQUIDATABLE'
+      (health) => isLiquidatableRaw(health.healthFactorRaw)
     );
   }
 
@@ -136,5 +146,10 @@ export class HealthChecker {
     return Array.from(healthMap.values()).filter(
       (health) => health.status !== 'SAFE'
     );
+  }
+
+  /** @notice Format a user's HF for logging. */
+  formatHF(health: UserHealth): string {
+    return formatHF(health.healthFactorRaw);
   }
 }

@@ -2,6 +2,7 @@ import { GraphQLClient, gql } from 'graphql-request';
 import { parseAbi, Address } from 'viem';
 import { logger } from '../utils/logger';
 import { config } from '../config';
+import { AAVE, HF, HF_RAW, hfRawToNumber, isPoolTierRaw, shouldPruneRaw } from '../config/thresholds';
 import { AssetManager } from './AssetManager';
 
 interface UserReserve {
@@ -27,11 +28,33 @@ interface User {
   reserves: UserReserve[];
 }
 
+export interface CandidateAssets {
+  collateralAssets: string[];
+  debtAssets: string[];
+  /** Per-asset USD value of collateral (lowercase asset -> USD). */
+  collateralUSDByAsset: Record<string, number>;
+  /** Per-asset USD value of debt (lowercase asset -> USD). */
+  debtUSDByAsset: Record<string, number>;
+}
+
+export interface ValidatedUser {
+  hf: number;
+  /** Raw 1e18 health factor from the on-chain call. */
+  hfRaw: bigint;
+  collateral: number;
+  debt: number;
+  collateralAssets: string[];
+  debtAssets: string[];
+  collateralUSDByAsset: Record<string, number>;
+  debtUSDByAsset: Record<string, number>;
+  /** Average liquidation threshold in bps (e.g. 8250 = 82.5%), from getUserAccountData. */
+  liquidationThresholdBps: bigint;
+}
+
 export class SubgraphService {
   private client: GraphQLClient;
   private assetManager: AssetManager;
   private publicClient: any;
-  private watchedCandidates: Set<string> = new Set();
 
   constructor(subgraphUrl: string, publicClient: any, assetManager: AssetManager, apiKey?: string) {
     this.publicClient = publicClient;
@@ -45,18 +68,14 @@ export class SubgraphService {
     });
   }
 
-  public getWatchedCandidates(): Set<string> {
-    return this.watchedCandidates;
-  }
-
   /**
    * @notice Get active borrowers from Aave V3 Subgraph (all debt assets, minimal filter)
-   * @dev Uses cursor-based pagination (1000 per batch), filters same-asset and stablecoin-only positions
-   * @dev Filters e-Mode users at query level (server-side) for efficiency
-   * @dev Threshold 1000 = $0.001 for USDC (6 decimals) or negligible for WETH (18 decimals)
-   * @return Map of user address to array of debt asset addresses
+   * @dev Uses cursor-based pagination (1000 per batch), filters e-Mode users at query level
+   * @dev Collateral composition is captured here (usageAsCollateralEnabledOnUser + balance > 0) so
+   *      WATCH-tier users can be triggered by price moves without any extra RPC.
+   * @return Map of user address to collateral/debt asset addresses
    */
-  async getActiveBorrowers(): Promise<Map<string, string[]>> {
+  async getActiveBorrowers(): Promise<Map<string, CandidateAssets>> {
     logger.info('Querying debt borrowers from Subgraph (excluding e-Mode users)...');
     const allUsers: User[] = [];
     let lastId = '';
@@ -123,61 +142,79 @@ export class SubgraphService {
     }
     logger.info(`Total found: ${allUsers.length} users with debt`);
       
-      const candidateUsers = new Map<string, string[]>();
+      const candidateUsers = new Map<string, CandidateAssets>();
       let filteredHealthy = 0;
       for (const user of allUsers) {
         const userAddress = user.id.toLowerCase();
         let totalDebtBase = 0;
         let totalThresholdBase = 0;
         const debtAssets: string[] = [];
+        const collateralAssets: string[] = [];
+        const collateralUSDByAsset: Record<string, number> = {};
+        const debtUSDByAsset: Record<string, number> = {};
 
         for (const reserve of user.reserves) {
           const priceInEth = parseFloat(reserve.reserve.price?.priceInEth || '0');
           const decimals = reserve.reserve.decimals || 18;
           const hasCollateral = reserve.usageAsCollateralEnabledOnUser && parseFloat(reserve.currentATokenBalance) > 0;
           const hasDebt = parseFloat(reserve.currentTotalDebt) > 0;
+          const assetAddress = reserve.reserve.underlyingAsset.toLowerCase();
 
           if (hasCollateral) {
             const balance = parseFloat(reserve.currentATokenBalance) / (10 ** decimals);
             const collateralBase = balance * priceInEth;
             const liqThreshold = parseFloat(reserve.reserve.reserveLiquidationThreshold || '0');
             totalThresholdBase += collateralBase * (liqThreshold / 10000);
+            collateralAssets.push(assetAddress);
+            collateralUSDByAsset[assetAddress] = (collateralUSDByAsset[assetAddress] ?? 0) + collateralBase;
           }
 
           if (hasDebt) {
             const debt = parseFloat(reserve.currentTotalDebt) / (10 ** decimals);
-            totalDebtBase += debt * priceInEth;
-            debtAssets.push(reserve.reserve.underlyingAsset);
+            const debtBase = debt * priceInEth;
+            totalDebtBase += debtBase;
+            debtAssets.push(assetAddress);
+            debtUSDByAsset[assetAddress] = (debtUSDByAsset[assetAddress] ?? 0) + debtBase;
           }
         }
 
         const estimatedHF = totalDebtBase === 0 ? Infinity : totalThresholdBase / totalDebtBase;
 
-        if (estimatedHF <= 1.15) {
-          candidateUsers.set(userAddress, debtAssets);
+        // Pre-filter uses a wide buffer: subgraph `priceInEth` lags the on-chain oracle, so a fast
+        // crash can make an on-chain-HF-0.98 user look like 1.20 here. Anything above the buffer is
+        // dropped; everything else is validated on-chain.
+        if (estimatedHF <= HF.SUBGRAPH_PREFILTER) {
+          candidateUsers.set(userAddress, {
+            collateralAssets,
+            debtAssets,
+            collateralUSDByAsset,
+            debtUSDByAsset,
+          });
         } else {
           filteredHealthy++;
         }
       }
-      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF > 1.15)`);
+      logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF > ${HF.SUBGRAPH_PREFILTER})`);
       logger.info(`Returning ${candidateUsers.size} candidate users for on-chain validation`);
       return candidateUsers;
   }
 
   /**
    * @notice Validate users on-chain using viem multicall for batch efficiency
-   * @dev Two-phase validation: HF screening → asset composition check, filters hedged positions
-   * @param userAddresses Array of user addresses to validate
-   * @param rpcUrl RPC endpoint URL
+   * @dev Two-phase validation: HF screening → asset composition check, filters hedged positions.
+   *      Returns two buckets: atRisk (HF < 1.075, asset composition verified on-chain) and
+   *      watched (1.075 <= HF <= 1.15, asset composition taken from the subgraph candidate list).
+   * @param candidates Map of user address to subgraph-derived collateral/debt assets
    * @param poolAddress Aave V3 Pool contract address
    * @param protocolDataProvider Protocol data provider address
-   * @return Map of user address to health data (HF < 1.075)
+   * @return atRisk (HF < 1.075) and watched (1.075 <= HF <= 1.15) user maps
    */
   async validateUsersOnChain(
-    userAddresses: string[],
+    candidates: Map<string, CandidateAssets>,
     poolAddress: string,
     protocolDataProvider: string
-  ): Promise<Map<string, { hf: number; collateral: number; debt: number; collateralAssets: string[]; debtAssets: string[] }>> {
+  ): Promise<{ atRisk: Map<string, ValidatedUser>; watched: Map<string, ValidatedUser> }> {
+    const userAddresses = Array.from(candidates.keys());
     logger.info(`Validating ${userAddresses.length} users on-chain via viem multicall...`);
     const client = this.publicClient;
     const poolAbi = parseAbi([
@@ -190,7 +227,8 @@ export class SubgraphService {
       'function getUserReserveData(address asset, address user) external view returns (uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool usageAsCollateralEnabled)',
     ]);
 
-    const results = new Map<string, { hf: number; collateral: number; debt: number; collateralAssets: string[]; debtAssets: string[] }>();
+    const atRiskResults = new Map<string, ValidatedUser>();
+    const watchedResults = new Map<string, ValidatedUser>();
     let totalValidated = 0;
     let filteredByHF = 0;
     let filteredByHedging = 0;
@@ -200,7 +238,7 @@ export class SubgraphService {
     try {
       const BATCH_SIZE = config.rateLimit.batchSize;
       const BATCH_DELAY_MS = config.rateLimit.batchDelayMs;
-      const atRiskUsers: Array<{ address: string; hf: number; collateral: number; debt: number }> = [];
+      const atRiskUsers: Array<{ address: string; hf: number; hfRaw: bigint; collateral: number; debt: number; liquidationThresholdBps: bigint }> = [];
       const totalBatches = Math.ceil(userAddresses.length / BATCH_SIZE);
       
       logger.info(`Validating ${userAddresses.length} users on-chain via multicall (${totalBatches} batches)...`);
@@ -224,6 +262,7 @@ export class SubgraphService {
         try {
           accountDataResults = await client.multicall({
             contracts: accountDataCalls,
+            allowFailure: true,
           });
         } catch (error: any) {
           if (error.code === 429 || error.message?.includes('compute units')) {
@@ -232,6 +271,7 @@ export class SubgraphService {
             await new Promise(resolve => setTimeout(resolve, backoffMs));
             accountDataResults = await client.multicall({
               contracts: accountDataCalls,
+              allowFailure: true,
             });
           } else {
             throw error;
@@ -242,33 +282,44 @@ export class SubgraphService {
           const accountDataResult = accountDataResults[i];
           if (accountDataResult.status === 'success' && accountDataResult.result) {
             const result = accountDataResult.result as unknown as readonly [bigint, bigint, bigint, bigint, bigint, bigint];
-            const [totalCollateralBase, totalDebtBase, , , , healthFactor] = result;
+            const [totalCollateralBase, totalDebtBase, , currentLiquidationThreshold, , healthFactorRaw] = result;
             const totalCollateralUSD = Number(totalCollateralBase) / 1e8;
             const totalDebtUSD = Number(totalDebtBase) / 1e8;
-            const hf = Number(healthFactor) / 1e18;
+            const hf = hfRawToNumber(healthFactorRaw);
             totalValidated++;
             const userAddr = batchAddresses[i].toLowerCase();
-            if (hf < 1.075 && totalDebtUSD >= 100) {
+            if (isPoolTierRaw(healthFactorRaw) && totalDebtUSD >= AAVE.MIN_TRACKED_DEBT_USD) {
               atRiskUsers.push({
                 address: batchAddresses[i],
                 hf,
+                hfRaw: healthFactorRaw,
                 collateral: totalCollateralUSD,
                 debt: totalDebtUSD,
+                liquidationThresholdBps: currentLiquidationThreshold,
               });
-              this.watchedCandidates.delete(userAddr);
+            } else if (!shouldPruneRaw(healthFactorRaw) && totalDebtUSD >= AAVE.MIN_TRACKED_DEBT_USD) {
+              // WATCH tier: keep tracking so a price move re-evaluates it, using subgraph asset composition
+              const assets = candidates.get(userAddr);
+              watchedResults.set(userAddr, {
+                hf,
+                hfRaw: healthFactorRaw,
+                collateral: totalCollateralUSD,
+                debt: totalDebtUSD,
+                collateralAssets: assets?.collateralAssets ?? [],
+                debtAssets: assets?.debtAssets ?? [],
+                collateralUSDByAsset: assets?.collateralUSDByAsset ?? {},
+                debtUSDByAsset: assets?.debtUSDByAsset ?? {},
+                liquidationThresholdBps: currentLiquidationThreshold,
+              });
+              filteredByHF++;
             } else {
-              if (hf <= 1.15 && totalDebtUSD >= 100) {
-                this.watchedCandidates.add(userAddr);
-              } else {
-                this.watchedCandidates.delete(userAddr);
-              }
               filteredByHF++;
             }
           }
         }
       }
       
-      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < 1.075, ${this.watchedCandidates.size} watched candidates (1.075 <= HF <= 1.15), filtered ${filteredByHF} healthy users`);
+      logger.info(`Phase 1 complete: ${atRiskUsers.length} users with HF < ${HF.POOL_TIER}, ${watchedResults.size} watched (${HF.POOL_TIER} <= HF < ${HF.WATCH_MAX}), filtered ${filteredByHF} healthy users`);
       
       const atRiskBatches = Math.ceil(atRiskUsers.length / BATCH_SIZE);
       logger.info(`Validating assets for ${atRiskUsers.length} at-risk users (${atRiskBatches} batches)...`);
@@ -292,6 +343,7 @@ export class SubgraphService {
         try {
           userConfigResults = await client.multicall({
             contracts: userConfigCalls,
+            allowFailure: true,
           });
         } catch (error: any) {
           if (error.code === 429 || error.message?.includes('compute units')) {
@@ -300,6 +352,7 @@ export class SubgraphService {
             await new Promise(resolve => setTimeout(resolve, backoffMs));
             userConfigResults = await client.multicall({
               contracts: userConfigCalls,
+              allowFailure: true,
             });
           } else {
             throw error;
@@ -340,6 +393,7 @@ export class SubgraphService {
                 if (reserveDataCalls.length > 0) {
                   const reserveDataResults = await client.multicall({
                     contracts: reserveDataCalls,
+                    allowFailure: true,
                   });
                   for (let k = 0; k < reserveDataResults.length; k++) {
                     const reserveResult = reserveDataResults[k];
@@ -378,13 +432,20 @@ export class SubgraphService {
             filteredByHedging++;
             continue;
           }
-          if (user.hf < 1.075) {
-            results.set(user.address.toLowerCase(), {
+          if (isPoolTierRaw(user.hfRaw)) {
+            // Per-asset USD breakdown comes from the subgraph candidate list. It is only used for
+            // local HF estimation between on-chain reads, so subgraph-level precision is enough.
+            const subgraphAssets = candidates.get(user.address.toLowerCase());
+            atRiskResults.set(user.address.toLowerCase(), {
               hf: user.hf,
+              hfRaw: user.hfRaw,
               collateral: user.collateral,
               debt: user.debt,
               collateralAssets,
               debtAssets,
+              collateralUSDByAsset: subgraphAssets?.collateralUSDByAsset ?? {},
+              debtUSDByAsset: subgraphAssets?.debtUSDByAsset ?? {},
+              liquidationThresholdBps: user.liquidationThresholdBps,
             });
           } else {
             filteredByHF++;
@@ -392,8 +453,8 @@ export class SubgraphService {
         }
       }
       logger.info(`Successfully validated ${totalValidated}/${userAddresses.length} users on-chain`);
-      logger.info(`Critical risk users (HF < 1.075): ${results.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
-      return results;
+      logger.info(`Critical risk users (HF < ${HF.POOL_TIER}): ${atRiskResults.size} | Watched (${HF.POOL_TIER}-${HF.WATCH_MAX}): ${watchedResults.size} | Filtered by HF/size: ${filteredByHF} | Filtered by hedging: ${filteredByHedging}`);
+      return { atRisk: atRiskResults, watched: watchedResults };
     } catch (error) {
       logger.error('Error during multicall validation:', error);
       throw error;
