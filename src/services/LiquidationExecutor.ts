@@ -50,7 +50,6 @@ export class LiquidationExecutor {
   constructor(rpcClient: any, preconfClient: any, account?: ReturnType<typeof createAccount>) {
     this.account = account || createAccount();
     this.chain = basePreconf;
-    // Broadcast langsung via Flashblocks Preconfirmation Sequencer
     this.walletClient = viemCreateWalletClient({
       account: this.account,
       chain: this.chain,
