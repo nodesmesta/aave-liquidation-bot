@@ -2,10 +2,8 @@ import { parseAbi, Address } from 'viem';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import {
-  HF_RAW,
   hfRawToNumber,
   isLiquidatableRaw,
-  formatHF,
 } from '../config/thresholds';
 
 export interface UserHealth {
@@ -19,7 +17,6 @@ export interface UserHealth {
   availableBorrowsBase: bigint;
   currentLiquidationThreshold: bigint;
   ltv: bigint;
-  status: 'LIQUIDATABLE' | 'CRITICAL' | 'WARNING' | 'SAFE';
 }
 
 export class HealthChecker {
@@ -57,7 +54,6 @@ export class HealthChecker {
       availableBorrowsBase,
       currentLiquidationThreshold,
       ltv,
-      status: this.determineStatus(healthFactorRaw),
     };
   }
 
@@ -100,7 +96,6 @@ export class HealthChecker {
             availableBorrowsBase,
             currentLiquidationThreshold,
             ltv,
-            status: this.determineStatus(healthFactorRaw),
           });
         } else {
           const errorMsg = result.error?.message || result.status;
@@ -109,19 +104,6 @@ export class HealthChecker {
       }
     }
     return results;
-  }
-
-  /**
-   * @notice Determine user status from the raw health factor
-   * @dev All comparisons are bigint, so a HF of 0.999999999999999999 is correctly LIQUIDATABLE.
-   * @param healthFactorRaw Raw 1e18-scaled health factor
-   * @return Status label for the user
-   */
-  private determineStatus(healthFactorRaw: bigint): UserHealth['status'] {
-    if (healthFactorRaw < HF_RAW.ONE) return 'LIQUIDATABLE';
-    if (healthFactorRaw < HF_RAW.CRITICAL) return 'CRITICAL';
-    if (healthFactorRaw < HF_RAW.WARNING) return 'WARNING';
-    return 'SAFE';
   }
 
   /**
@@ -134,22 +116,5 @@ export class HealthChecker {
     return Array.from(healthMap.values()).filter(
       (health) => isLiquidatableRaw(health.healthFactorRaw)
     );
-  }
-
-  /**
-   * @notice Filter users with any risk level (not SAFE)
-   * @dev Excludes only users with status 'SAFE' (HF >= 1.1)
-   * @param healthMap Map of user addresses to health data
-   * @return Array of risky users (LIQUIDATABLE, CRITICAL, or WARNING with HF < 1.1)
-   */
-  filterRisky(healthMap: Map<string, UserHealth>): UserHealth[] {
-    return Array.from(healthMap.values()).filter(
-      (health) => health.status !== 'SAFE'
-    );
-  }
-
-  /** @notice Format a user's HF for logging. */
-  formatHF(health: UserHealth): string {
-    return formatHF(health.healthFactorRaw);
   }
 }

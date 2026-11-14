@@ -33,10 +33,11 @@ export class LiquidationManager {
 
   /**
    * @notice Handle Chainlink price update events
-   * @dev Two-stage filtering keeps RPC usage proportional to actual risk:
-   *      1. Every affected user gets a local HF estimate from the cached per-asset USD breakdown.
-   *         Only users whose estimate can fall below PRICE_TRIGGER are sent to the RPC.
-   *      2. High-risk users (cached HF <= 1.03) are checked first, then the rest.
+   * @dev The local cache is used ONLY to resolve which users are exposed to the moved asset
+   *      (reverse collateral/debt indexes). Every affected user is then verified on-chain in both
+   *      phases - the cached HF never decides whether an RPC read happens.
+   *      Cached HF is used for one thing only: ordering, so users already near the threshold are
+   *      checked first and can be liquidated before the rest of the batch is fetched.
    *      Updates arriving while a check is running are queued and replayed, never dropped.
    * @param updates Array of price updates from Chainlink
    */
@@ -44,7 +45,7 @@ export class LiquidationManager {
     if (updates.length === 0) return;
     this.priceUpdateTimestamp = Date.now();
 
-    // Price multipliers for the local estimate (newPrice / oldPrice).
+    // Price multipliers, kept only so a queued replay can re-evaluate the same assets.
     const priceChanges = new Map<string, number>();
     for (const update of updates) {
       const asset = update.asset.toLowerCase();
@@ -54,7 +55,6 @@ export class LiquidationManager {
 
     const highRiskUsers = new Set<string>();
     const allAffectedUsers = new Set<string>();
-    const candidatesForRpc = new Set<string>();
 
     for (const update of updates) {
       const assetAddress = update.asset.toLowerCase();
@@ -63,20 +63,9 @@ export class LiquidationManager {
 
       for (const user of [...usersWithCollateral, ...usersWithDebt]) {
         allAffectedUsers.add(user.address);
+        // Ordering hint only. A stale cached HF must never suppress an on-chain read.
         if (user.lastCheckedHFRaw <= HF_RAW.HIGH_RISK) {
           highRiskUsers.add(user.address);
-          candidatesForRpc.add(user.address);
-          continue;
-        }
-        // Local estimate: skip the RPC entirely when the move cannot push this user near 1.0.
-        const estimated = this.userPool.estimateHFAfterPriceChange(user.address, priceChanges);
-        if (estimated === null) {
-          // No breakdown available (e.g. restored snapshot) - must verify on-chain.
-          candidatesForRpc.add(user.address);
-          continue;
-        }
-        if (estimated <= HF_RAW.WARNING) {
-          candidatesForRpc.add(user.address);
         }
       }
 
@@ -85,12 +74,12 @@ export class LiquidationManager {
       logger.info(
         `${assetSymbol} ${direction}${Math.abs(update.percentChange).toFixed(2)}% ` +
         `($${update.oldPrice.toFixed(2)}→$${update.newPrice.toFixed(2)}) affects ${allAffectedUsers.size} users ` +
-        `(${highRiskUsers.size} high-risk, ${candidatesForRpc.size} need RPC)`
+        `(${highRiskUsers.size} high-risk first, all ${allAffectedUsers.size} verified on-chain)`
       );
     }
 
-    if (candidatesForRpc.size === 0) {
-      logger.debug(`Price move affects ${allAffectedUsers.size} users but none can reach HF ${HF.PRICE_TRIGGER} - no RPC needed`);
+    if (allAffectedUsers.size === 0) {
+      logger.debug('Price move affects no tracked users - no RPC needed');
       return;
     }
 
@@ -103,7 +92,7 @@ export class LiquidationManager {
       return;
     }
 
-    await this.checkHighRiskThenUpdateCache(Array.from(highRiskUsers), Array.from(candidatesForRpc));
+    await this.checkHighRiskThenUpdateCache(Array.from(highRiskUsers), Array.from(allAffectedUsers));
   }
 
   /**
@@ -134,7 +123,13 @@ export class LiquidationManager {
   }
 
   /**
-   * @notice Check high-risk users first, execute if liquidatable, otherwise check and update cache for all affected
+   * @notice Check high-risk users first, execute if liquidatable, then verify every remaining
+   *         affected user on-chain and refresh the cache from those on-chain reads.
+   * @dev Both phases call `getUserAccountData`. Phase 1 is a latency optimisation (liquidate the
+   *      most likely candidate before paying for the rest of the batch), not a filter: Phase 2
+   *      always covers the users Phase 1 did not touch.
+   * @param highRiskUsers Users whose cached HF is <= HIGH_RISK, checked first
+   * @param allAffectedUsers Every user exposed to the moved asset(s), all verified on-chain
    */
   private async checkHighRiskThenUpdateCache(highRiskUsers: string[], allAffectedUsers: string[]): Promise<void> {
     if (this.isCheckingUsers) return;

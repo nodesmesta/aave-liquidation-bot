@@ -278,48 +278,11 @@ export class UserPool {
   }
 
   /**
-   * @notice Estimate the health factor after a price move, without any RPC call
-   * @dev Uses the per-asset USD breakdown captured at the last on-chain read plus the stored
-   *      liquidation-threshold ratio. Both are price-independent, so the estimate stays consistent
-   *      with Aave's own formula (HF = collateral * threshold / debt) as prices move.
-   *      Returns `null` when the user has no debt or no breakdown, in which case the caller must
-   *      fall back to an on-chain read.
-   * @param address User address
-   * @param priceChanges Map of lowercase asset address -> price multiplier (newPrice / oldPrice)
-   * @return Estimated raw health factor, or null when it cannot be computed
-   */
-  estimateHFAfterPriceChange(address: string, priceChanges: Map<string, number>): bigint | null {
-    const user = this.users.get(address.toLowerCase());
-    if (!user || user.debtUSD <= 0) return null;
-    const collateralKeys = Object.keys(user.collateralUSDByAsset);
-    const debtKeys = Object.keys(user.debtUSDByAsset);
-    if (collateralKeys.length === 0 || debtKeys.length === 0) return null;
-    if (!Number.isFinite(user.liquidationThresholdRatio) || user.liquidationThresholdRatio <= 0) return null;
-
-    let collateralUSD = 0;
-    for (const asset of collateralKeys) {
-      const multiplier = priceChanges.get(asset) ?? 1;
-      collateralUSD += user.collateralUSDByAsset[asset] * multiplier;
-    }
-    let debtUSD = 0;
-    for (const asset of debtKeys) {
-      const multiplier = priceChanges.get(asset) ?? 1;
-      debtUSD += user.debtUSDByAsset[asset] * multiplier;
-    }
-    if (debtUSD <= 0) return null;
-
-    const estimatedHF = (collateralUSD * user.liquidationThresholdRatio) / debtUSD;
-    if (!Number.isFinite(estimatedHF)) return null;
-    // Clamp to a sane range before converting to bigint (Infinity is not representable).
-    const clamped = Math.min(Math.max(estimatedHF, 0), 1e6);
-    return BigInt(Math.round(clamped * 1e18));
-  }
-
-  /**
    * @notice Update a user's on-chain health factor
-   * @dev Stores both the raw bigint (used for decisions) and its display mirror. When the on-chain
-   *      average liquidation threshold is supplied it is stored as a ratio, which keeps the local
-   *      price-move estimate exact.
+   * @dev Stores both the raw bigint (used for decisions) and its display mirror. The on-chain
+   *      average liquidation threshold is stored as a ratio for reporting only: health-factor
+   *      decisions always come from an on-chain `getUserAccountData` read, never from a local
+   *      estimate.
    * @param address User address
    * @param healthFactorRaw Raw 1e18-scaled health factor
    * @param liquidationThresholdBps Average liquidation threshold in bps (e.g. 8250 = 82.5%)
