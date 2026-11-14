@@ -2,7 +2,7 @@ import { GraphQLClient, gql } from 'graphql-request';
 import { parseAbi, Address } from 'viem';
 import { logger } from '../utils/logger';
 import { config } from '../config';
-import { AAVE, HF, HF_RAW, hfRawToNumber, isPoolTierRaw, shouldPruneRaw } from '../config/thresholds';
+import { AAVE, HF, hfRawToNumber, isPoolTierRaw, shouldPruneRaw } from '../config/thresholds';
 import { AssetManager } from './AssetManager';
 
 interface UserReserve {

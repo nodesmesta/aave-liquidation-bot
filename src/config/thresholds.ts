@@ -38,8 +38,6 @@ export const HF = {
   /** Subgraph pre-filter buffer. Raised from 1.15: subgraph `priceInEth` lags the on-chain
    *  oracle, so a fast crash can make an on-chain-HF-0.98 user look like 1.20 off-chain. */
   SUBGRAPH_PREFILTER: 1.5,
-  /** Price-triggered re-check only runs for users whose worst-case HF can fall below this. */
-  PRICE_TRIGGER: 1.1,
 } as const;
 
 /** Aave V3 liquidation constants (mirrors LiquidationLogic.sol). */
@@ -64,8 +62,6 @@ export const AAVE = {
 export const TIMING = {
   /** A tracked user whose HF has not been refreshed for this long is always re-checked. */
   MAX_HF_STALENESS_MS: 10 * 60 * 1000,
-  /** Periodic sweep of the POOL tier, independent of price events. */
-  POOL_SWEEP_INTERVAL_MS: 60 * 1000,
   /** Max users for which full liquidation params are computed per cycle. */
   MAX_PARAM_CANDIDATES: 5,
 } as const;

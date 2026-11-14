@@ -1,7 +1,7 @@
 import { createPublicClient, http, formatEther } from 'viem';
 import { base, basePreconf } from 'viem/chains';
 import { config, validateConfig } from './config';
-import { HF, HF_RAW, TIMING, hfRawToNumber, isLiquidatableRaw, isPoolTierRaw, shouldPruneRaw, formatHF } from './config/thresholds';
+import { HF, hfRawToNumber, isPoolTierRaw, shouldPruneRaw, formatHF } from './config/thresholds';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { logger } from './utils/logger';
@@ -195,11 +195,10 @@ class LiquidatorBot {
       void this.startBackgroundSync().catch((error) => logger.error('Background sync failed:', error));
     }, DISCOVERY_INTERVAL_MS);
 
-    // 5. Periodic POOL sweep. Interest accrual lowers HF with no price event at all, so a
-    //    price-only trigger would never notice those positions drifting under 1.0.
-    setInterval(() => {
-      void this.sweepPoolTier().catch((error) => logger.error('POOL sweep failed:', error));
-    }, TIMING.POOL_SWEEP_INTERVAL_MS);
+    // 5. No periodic HF sweep. Health-factor detection is driven exclusively by Chainlink
+    //    price events: every event resolves the exposed users from the pool indexes and then
+    //    verifies each of them on-chain. A timer-based sweep would re-introduce a second,
+    //    independent detection path that the event pipeline already covers.
 
     // Heartbeat & UserPool snapshot export
     setInterval(() => {
@@ -339,43 +338,6 @@ class LiquidatorBot {
       config.network.wssUrl
     );
     this.isPriceMonitoring = true;
-  }
-
-
-
-  /**
-   * @notice Periodic sweep of the POOL tier, independent of price events
-   * @dev Interest accrual lowers HF without any Chainlink update, so a price-only trigger would
-   *      never notice those positions. Only the POOL tier (HF < 1.075) is swept, which keeps the
-   *      RPC cost bounded and proportional to the number of genuinely at-risk users.
-   */
-  private async sweepPoolTier(): Promise<void> {
-    if (!this.isInitialized || this.isRestarting) return;
-    const poolUsers = this.userPool.getAllUsers().filter(u => u.tier === 'POOL');
-    if (poolUsers.length === 0) return;
-    try {
-      const healthMap = await this.healthChecker.checkUsers(poolUsers.map(u => u.address));
-      let removed = 0;
-      let promoted = 0;
-      for (const [address, health] of healthMap.entries()) {
-        if (health.totalDebtBase === 0n || shouldPruneRaw(health.healthFactorRaw)) {
-          this.userPool.removeUser(address);
-          removed++;
-          continue;
-        }
-        const tier: UserTier = isPoolTierRaw(health.healthFactorRaw) ? 'POOL' : 'WATCH';
-        if (tier !== 'POOL') {
-          this.userPool.setTier(address, tier);
-        }
-        this.userPool.updateUserHF(address, health.healthFactorRaw, health.currentLiquidationThreshold);
-        if (isLiquidatableRaw(health.healthFactorRaw)) promoted++;
-      }
-      if (removed > 0 || promoted > 0) {
-        logger.info(`POOL sweep: ${poolUsers.length} checked, ${removed} removed, ${promoted} liquidatable`);
-      }
-    } catch (error) {
-      logger.error('Error during POOL sweep:', error);
-    }
   }
 
   /**
