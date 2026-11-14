@@ -60,8 +60,6 @@ export const AAVE = {
 
 /** Timing knobs for the detection pipeline. */
 export const TIMING = {
-  /** A tracked user whose HF has not been refreshed for this long is always re-checked. */
-  MAX_HF_STALENESS_MS: 10 * 60 * 1000,
   /** Max users for which full liquidation params are computed per cycle. */
   MAX_PARAM_CANDIDATES: 5,
 } as const;
