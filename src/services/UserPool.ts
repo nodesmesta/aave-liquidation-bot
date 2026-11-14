@@ -203,7 +203,7 @@ export class UserPool {
     }
     const removed = this.users.delete(normalizedAddress);
     if (removed) {
-      logger.info(`Removed user ${normalizedAddress} from pool`);
+      logger.debug(`Removed user ${normalizedAddress} from pool`);
     }
     return removed;
   }

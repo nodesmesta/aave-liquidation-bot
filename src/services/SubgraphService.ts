@@ -195,7 +195,6 @@ export class SubgraphService {
         }
       }
       logger.info(`Found ${candidateUsers.size} candidates (excluded e-Mode users at query level, filtered ${filteredHealthy} healthy users with Est. HF > ${HF.SUBGRAPH_PREFILTER})`);
-      logger.info(`Returning ${candidateUsers.size} candidate users for on-chain validation`);
       return candidateUsers;
   }
 
@@ -215,7 +214,6 @@ export class SubgraphService {
     protocolDataProvider: string
   ): Promise<{ atRisk: Map<string, ValidatedUser>; watched: Map<string, ValidatedUser> }> {
     const userAddresses = Array.from(candidates.keys());
-    logger.info(`Validating ${userAddresses.length} users on-chain via viem multicall...`);
     const client = this.publicClient;
     const poolAbi = parseAbi([
       'function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',

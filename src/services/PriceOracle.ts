@@ -423,7 +423,7 @@ export class PriceOracle {
                 });
               }
               if (updates.length > 0) {
-                logger.info(`[PriceOracle] SVR SecondaryRoundIdUpdated for ${assetEntries.map(e => e.asset).join(',')} round ${roundIdStr}: $${newPrice}`);
+                logger.debug(`[PriceOracle] SVR SecondaryRoundIdUpdated for ${assetEntries.map(e => e.asset).join(',')} round ${roundIdStr}: $${newPrice}`);
                 onPriceChange(updates);
               }
             } catch (error) {
