@@ -200,7 +200,7 @@ class LiquidatorBot {
     //    verifies each of them on-chain. A timer-based sweep would re-introduce a second,
     //    independent detection path that the event pipeline already covers.
 
-    // Heartbeat & UserPool snapshot export
+    // UserPool snapshot export (telemetry only - no HF detection happens here)
     setInterval(() => {
       void this.exportUserPoolSnapshot();
     }, SNAPSHOT_INTERVAL_MS);
@@ -477,9 +477,8 @@ class LiquidatorBot {
       const tmpPath = `${SNAPSHOT_PATH}.tmp`;
       await fs.writeFile(tmpPath, JSON.stringify(snapshot, null, 2));
       await fs.rename(tmpPath, SNAPSHOT_PATH);
-      logger.info(`[Heartbeat] UserPool synced: ${users.length} users (${stats.pool} pool / ${stats.watched} watch, ${stats.critical} critical, ${stats.liquidatable} liquidatable) | TVL: $${(stats.totalCollateralUSD / 1000).toFixed(0)}K/$${(stats.totalDebtUSD / 1000).toFixed(0)}K`);
     } catch (error) {
-      logger.error(`[Heartbeat] Snapshot export failed (bot keeps running):`, error);
+      logger.error('Snapshot export failed (bot keeps running):', error);
     } finally {
       this.isExportingSnapshot = false;
     }
